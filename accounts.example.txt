@@ -1,0 +1,4 @@
+# Định dạng file đầu vào: email|password|refresh_token|client_id
+# Mỗi dòng 1 tài khoản Hotmail Trusted (OAuth2 Mozilla Thunderbird Client ID: 9e5f94bc-e8a4-4e73-b8be-63364c29d753)
+example_user1@hotmail.com|Password123!|M.C514_SN1.0.U.MsaArtifacts.-CpbC4yqa8PycFySzQxZ...|9e5f94bc-e8a4-4e73-b8be-63364c29d753
+example_user2@hotmail.com|Password456!|M.C556_SN1.0.U.MsaArtifacts.-Cu8r6*RDIWg!g07b7L...|9e5f94bc-e8a4-4e73-b8be-63364c29d753

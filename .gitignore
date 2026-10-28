@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments & venv
+.venv/
+venv/
+ENV/
+env/
+
+# Data & Accounts (NEVER COMMIT SENSITIVE ACCOUNTS/PASSWORDS/TOKENS)
+data/
+output/
+*.txt
+!requirements.txt
+!accounts.example.txt
+*.json
+*.csv
+*.log
+
+# Sensitive secrets & credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Operating System
+.DS_Store
+Thumbs.db
