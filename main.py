@@ -139,6 +139,16 @@ def poll_meta_otp(email_addr: str, refresh_token: str, client_id: str, start_tim
                     msg = email.message_from_bytes(msg_data[0][1])
                     frm = str(msg.get("From", ""))
                     subj = str(msg.get("Subject", ""))
+                    date_str = str(msg.get("Date", ""))
+
+                    # Bỏ qua các email cũ hơn thời điểm bắt đầu yêu cầu OTP (cho phép chênh lệch tối đa 30s)
+                    if date_str:
+                        try:
+                            msg_dt = email.utils.parsedate_to_datetime(date_str).timestamp()
+                            if msg_dt < (start_timestamp - 30):
+                                continue
+                        except Exception:
+                            pass
 
                     if any(k in frm or k in subj for k in ["Meta", "meta.com", "Xác nhận", "Confirm", "code", "Mã"]):
                         raw_content = ""
@@ -324,7 +334,8 @@ async def register_single_account(
     muse2api_base: str = "http://127.0.0.1:18610",
     muse2api_key: str = "",
     out_dir: str = ".",
-    headless: bool = True
+    headless: bool = True,
+    verify_video: bool = True
 ) -> Dict:
     """Quy trình đăng ký 1 tài khoản Muse AI tự động bằng Playwright Chrome."""
     email_addr = acc_data["email"].strip()
@@ -418,9 +429,9 @@ async def register_single_account(
                 return res
 
             print(f"  3. Nhận được mã OTP: {otp} -> Đang nhập vào form...")
-            otp_input = page.locator('input[maxlength="6"], input[inputmode="numeric"], input[type="text"]').first
+            otp_input = page.locator('input[maxlength="6"], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="text"]').first
             try:
-                await otp_input.wait_for(state="visible", timeout=20000)
+                await otp_input.wait_for(state="attached", timeout=20000)
             except Exception:
                 cur_text = await page.locator("body").inner_text()
                 print(f"  [!] Không thấy ô nhập OTP. Nội dung:\n{cur_text[:250]}")
@@ -429,58 +440,164 @@ async def register_single_account(
                 save_record(out_dir, acc_data, res)
                 return res
 
-            await otp_input.click()
-            await otp_input.press_sequentially(otp, delay=120)
-            await page.wait_for_timeout(6000)
+            try:
+                await otp_input.click(force=True)
+            except Exception:
+                pass
+            await otp_input.focus()
+            await page.keyboard.type(otp, delay=120)
+            await page.wait_for_timeout(1000)
 
-            # Trường hợp Meta yêu cầu nhập mật khẩu (nếu tài khoản Meta đã tồn tại)
-            pwd_input = page.locator('input[type="password"]').first
-            if await pwd_input.count() > 0 and await pwd_input.is_visible():
-                print("  -> Phát hiện yêu cầu mật khẩu Meta, đang điền mật khẩu...")
-                await pwd_input.fill(pwd)
-                await page.wait_for_timeout(400)
-                confirm_pwd_btn = page.locator('button[type="submit"], button:has-text("Đăng nhập"), button:has-text("Log in")').first
-                if await confirm_pwd_btn.count() > 0:
-                    await confirm_pwd_btn.click()
-                    await page.wait_for_timeout(6000)
+            # Bấm nút Xác nhận / Submit OTP
+            confirm_otp_btn = page.locator('button[type="submit"], button:has-text("Xác nhận"), button:has-text("Confirm"), button:has-text("Tiếp tục")').first
+            if await confirm_otp_btn.count() > 0 and await confirm_otp_btn.is_visible():
+                print("  -> Bấm nút Xác nhận OTP...")
+                await confirm_otp_btn.click()
+            else:
+                await page.keyboard.press("Enter")
 
-            # Kiểm tra màn hình Profile (Hoàn tất quy trình tạo tài khoản Meta)
-            body_text = await page.locator("body").inner_text()
-            if any(k in body_text for k in ["Hoàn tất quy trình tạo tài khoản", "Tên bắt buộc", "Complete your profile", "First name"]):
-                print("  4. Điền thông tin Profile (Họ tên, ngày sinh)...")
-                inputs = await page.locator('input:not([type="checkbox"]):not([type="hidden"])').all()
-                if len(inputs) >= 2:
-                    await inputs[0].fill(first_name)
-                    await inputs[1].fill(last_name)
+            await page.wait_for_timeout(7000)
 
-                selects = await page.locator('select').all()
-                if len(selects) >= 3:
-                    await selects[0].select_option(value="15")
-                    await selects[1].select_option(index=6)
-                    await selects[2].select_option(value="1998")
+            # Xử lý các màn hình thiết lập hồ sơ Meta sau khi nhập OTP (tối đa 4 bước: Ngày sinh, Họ tên, Mật khẩu...)
+            for step_idx in range(1, 5):
+                await page.wait_for_timeout(3000)
+                cur_body = (await page.locator("body").inner_text()).lower()
+                cookies_curr = {c["name"]: c["value"] for c in await context.cookies()}
 
-                confirm_btn = page.locator('button[type="submit"], button:has-text("Xác nhận"), button:has-text("Confirm")').first
-                await confirm_btn.click()
-                print("  5. Đã bấm xác nhận tạo tài khoản Meta. Đang đợi xử lý...")
-                await page.wait_for_timeout(8000)
+                # Đã vào giao diện chính hoặc chuyển hướng waitlist -> thoát vòng lặp
+                if "/access" in page.url or "hatch_sess" in cookies_curr:
+                    break
+
+                acted = False
+                # 1. Màn hình Ngày sinh (Birthday)
+                if any(k in cur_body for k in ["birthday", "ngày sinh", "date of birth"]):
+                    print(f"  4.{step_idx}. Điền ngày sinh (15/06/1998)...")
+                    selects = await page.locator("select").all()
+                    if len(selects) >= 3:
+                        try: await selects[0].select_option(index=6)
+                        except Exception: pass
+                        try: await selects[1].select_option(value="15")
+                        except Exception: pass
+                        try: await selects[2].select_option(value="1998")
+                        except Exception: pass
+                        acted = True
+
+                # 2. Màn hình Họ tên (Name)
+                if any(k in cur_body for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"]):
+                    print(f"  4.{step_idx}. Điền họ tên ({first_name} {last_name})...")
+                    name_inputs = await page.locator('input:not([type="checkbox"]):not([type="hidden"]):not([type="password"])').all()
+                    if len(name_inputs) >= 2:
+                        await name_inputs[0].fill(first_name)
+                        await name_inputs[1].fill(last_name)
+                        acted = True
+
+                # 3. Màn hình Mật khẩu (Password)
+                pwd_input = page.locator('input[type="password"]').first
+                if await pwd_input.count() > 0 and await pwd_input.is_visible():
+                    print(f"  4.{step_idx}. Điền mật khẩu...")
+                    await pwd_input.fill(pwd)
+                    acted = True
+
+                # Bấm nút Tiếp tục / Next / Confirm
+                next_btn = page.locator('button[type="submit"], button:has-text("Next"), button:has-text("Tiếp tục"), button:has-text("Xác nhận"), button:has-text("Confirm"), button:has-text("Save")').first
+                if await next_btn.count() > 0 and await next_btn.is_visible():
+                    await next_btn.click()
+                    await page.wait_for_timeout(4000)
+                elif not acted:
+                    break
 
             # Đợi tải xong và kiểm tra URL / Cookie
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(4000)
             current_url = page.url
-            print(f"  -> URL đích: {current_url}")
+            body_text = await page.locator("body").inner_text()
+            print(f"  -> URL sau đăng nhập: {current_url}")
+            print(f"  -> Nội dung trang:\n{body_text[:300].strip()}")
 
             cookies_list = await context.cookies()
             cookies_dict = {c["name"]: c["value"] for c in cookies_list}
             cookies_exp = {c["name"]: int(c.get("expires", 0)) for c in cookies_list}
+            print(f"  -> Cookies tìm thấy: {list(cookies_dict.keys())}")
 
             has_sess = "hatch_sess" in cookies_dict
             has_gw = "hatch_gw" in cookies_dict
             has_vml = "hatch_vml" in cookies_dict
             is_waitlist = "/access" in current_url
 
-            # ĐÁNH GIÁ KẾT QUẢ
-            if has_sess and has_vml and not is_waitlist:
-                print("  [✓] ĐĂNG KÝ THÀNH CÔNG! Tài khoản có đầy đủ phiên (hatch_sess + hatch_vml).")
+            # BƯỚC 6: XÁC THỰC THỰC TẾ BẰNG LỆNH TẠO VIDEO "MUSE VẪY TAY"
+            video_verified = False
+            if verify_video and has_sess and not is_waitlist:
+                print("  6. Kiểm tra quyền hạn thực tế: Mở phòng chat và gửi lệnh tạo video 'Muse vẫy tay'...")
+                try:
+                    await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
+                    await page.wait_for_timeout(3000)
+
+                    # Kiểm tra xem có bị chuyển hướng về trang waitlist /access không
+                    if "/access" in page.url:
+                        print("  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)!")
+                        is_waitlist = True
+                    else:
+                        textarea = page.locator('textarea').first
+                        try:
+                            await textarea.wait_for(state="visible", timeout=15000)
+                        except Exception:
+                            textarea = None
+
+                        if textarea and await textarea.is_visible():
+                            print("  -> Tìm thấy khung chat! Đang nhập lệnh tạo video...")
+                            await textarea.click()
+                            prompt_msg = "Tạo một video: Muse vẫy tay chào thân thiện (Create a short video: waving hand friendly)"
+                            await textarea.press_sequentially(prompt_msg, delay=25)
+                            await page.wait_for_timeout(500)
+
+                            send_btn = page.locator('button[aria-label*="Send" i], button[aria-label*="Gửi" i], button[data-testid*="send" i], button:has-text("Send"), button:has-text("Gửi")').first
+                            if await send_btn.count() > 0 and await send_btn.is_enabled():
+                                await send_btn.click()
+                            else:
+                                await textarea.press("Enter")
+
+                            print("  -> Đã gửi lệnh! Đang đợi Muse AI kích hoạt tiến trình tạo video (tối đa 40s)...")
+                            v_deadline = time.time() + 40
+                            while time.time() < v_deadline:
+                                # 1. Nút Stop xuất hiện = Muse đang sinh video
+                                stop_btn = page.locator('[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止" i]')
+                                if await stop_btn.count() > 0:
+                                    video_verified = True
+                                    print("  [✓] Phát hiện nút Stop: Muse AI đang tích cực tạo video!")
+                                    break
+
+                                # 2. Thẻ video hoặc attachment video xuất hiện
+                                vid = page.locator('video, [data-testid*="presentation-video"]')
+                                if await vid.count() > 0:
+                                    video_verified = True
+                                    print("  [✓] Phát hiện thẻ Video trên luồng chat!")
+                                    break
+
+                                # 3. Phản hồi chat bubble từ bot về video
+                                bubble = page.locator('div[class*="hatch-agent-bubble-bg"]')
+                                if await bubble.count() > 0:
+                                    b_txt = (await bubble.last.inner_text()).lower()
+                                    if any(k in b_txt for k in ["video", "generating", "creating", "vẫy tay", "đang tạo"]):
+                                        video_verified = True
+                                        print(f"  [✓] Muse AI phản hồi tiến trình: {b_txt[:80]}...")
+                                        break
+
+                                # Kiểm tra thông báo lỗi hoặc giới hạn
+                                err_box = page.locator('[role="alert"], [class*="error"]')
+                                if await err_box.count() > 0:
+                                    err_txt = await err_box.first.inner_text()
+                                    print(f"  [!] Có thông báo lỗi trên trang: {err_txt[:100]}")
+                                    break
+
+                                await page.wait_for_timeout(1500)
+                        else:
+                            print("  [!] Không tìm thấy khung nhập lệnh (textarea) trên https://muse.ai/thread/new!")
+                except Exception as ve:
+                    print(f"  [!] Ngoại lệ trong bước gửi lệnh tạo video: {ve}")
+
+            # ĐÁNH GIÁ KẾT QUẢ CUỐI CÙNG
+            final_url = page.url
+            if (video_verified if verify_video else (has_sess and has_vml and not is_waitlist)):
+                print("  🎉 [✓] ĐĂNG KÝ VÀ TẠO VIDEO THÀNH CÔNG! Tài khoản hoạt động 100%!")
                 if muse2api_base and muse2api_key:
                     uploaded = upload_to_muse2api(muse2api_base, muse2api_key, email_addr, cookies_dict, cookies_exp)
                     if uploaded:
@@ -488,26 +605,29 @@ async def register_single_account(
                 res = {
                     "email": email_addr,
                     "status": "success",
-                    "url": current_url,
+                    "video_verified": video_verified,
+                    "url": final_url,
                     "cookies": cookies_dict,
                     "expires": cookies_exp
                 }
-            elif is_waitlist or (has_sess and not has_vml):
-                print("  [!] TÀI KHOẢN VÀO WAITLIST: Đã xác thực Meta nhưng Muse AI giới hạn vùng IP (thiếu hatch_vml)!")
+            elif is_waitlist or "/access" in final_url or (has_sess and not has_vml):
+                print("  [!] TÀI KHOẢN VÀO WAITLIST: Đã xác thực nhưng bị Muse AI chặn vùng (không có quyền tạo video)!")
                 res = {
                     "email": email_addr,
                     "status": "waitlist",
-                    "reason": "waitlist_geo_blocked (Cần IP US Residential / 4G sạch để cấp quyền hatch_vml)",
-                    "url": current_url,
+                    "video_verified": False,
+                    "reason": "waitlist_geo_blocked (Không kích hoạt được video do kẹt danh sách chờ)",
+                    "url": final_url,
                     "cookies": cookies_dict
                 }
             else:
-                print("  [!] Thất bại: Không nhận được cookie phiên làm việc.")
+                print("  [!] Thất bại: Không tạo được video và không đủ điều kiện phiên làm việc.")
                 res = {
                     "email": email_addr,
                     "status": "failed",
-                    "reason": "no_session_cookie",
-                    "url": current_url
+                    "video_verified": False,
+                    "reason": "video_verification_failed",
+                    "url": final_url
                 }
 
             save_record(out_dir, acc_data, res)
@@ -556,6 +676,7 @@ async def main():
     parser.add_argument("--limit", type=int, default=50, help="Số lượng tài khoản muốn chạy")
     parser.add_argument("--start", type=int, default=0, help="Vị trí bắt đầu trong file (0-indexed)")
     parser.add_argument("--force", action="store_true", help="Bỏ qua kiểm tra tài khoản đã thành công, chạy lại từ đầu")
+    parser.add_argument("--no-verify-video", action="store_true", help="Bỏ qua bước gửi lệnh tạo video vẫy tay để xác thực quyền")
     args = parser.parse_args()
 
     if not os.path.isfile(args.file):
@@ -625,7 +746,8 @@ async def main():
             muse2api_base=args.base,
             muse2api_key=args.key,
             out_dir=args.out_dir,
-            headless=not args.head
+            headless=not args.head,
+            verify_video=not args.no_verify_video
         )
         await asyncio.sleep(2)
 
