@@ -1,6 +1,6 @@
 # Auto-Reg-Mu: Tool Tự Động Đăng Ký Meta Muse AI (muse.ai)
 
-Bộ công cụ tự động hóa đăng ký tài khoản **Meta Muse AI** (`https://muse.ai/`) hàng loạt từ danh sách Hotmail OAuth2, tự động bóc tách mã xác nhận Meta (OTP) qua IMAP XOAUTH2, hỗ trợ xoay Proxy/4G, vượt cơ chế chống bot (Stealth Browser), phân loại kết quả chuẩn xác 3 tầng và tự động nạp phiên hoạt động vào pool `muse2api`.
+Bộ công cụ tự động hóa đăng ký tài khoản **Meta Muse AI** (`https://muse.ai/`) hàng loạt từ danh sách Outlook OAuth2, tự động bóc tách mã xác nhận Meta (OTP) qua **cả IMAP XOAUTH2 lẫn Microsoft Graph API**, hỗ trợ xoay Proxy/4G, vượt cơ chế chống bot (Stealth Browser), phân loại kết quả chuẩn xác 3 tầng và tự động nạp phiên hoạt động vào pool `muse2api`.
 
 ---
 
@@ -8,7 +8,8 @@ Bộ công cụ tự động hóa đăng ký tài khoản **Meta Muse AI** (`htt
 
 1. **Auto Registration Thông Minh**:
    - Tự động điền email, gửi yêu cầu đăng ký lên Meta.
-   - Kết nối máy chủ Outlook qua giao thức IMAP XOAUTH2 trực tiếp, đọc mã OTP 6 chữ số chỉ sau 2-3 giây (quét cả `Inbox` và `Junk/Spam`).
+   - Đọc mã OTP 6 chữ số qua 2 đường song song (quét cả `Inbox` và `Junk/Spam`): IMAP XOAUTH2 trực tiếp (`outlook.office365.com`) và Microsoft Graph API (`/me/mailFolders/.../messages`). Chế độ `--otp-method auto` (mặc định) tự dùng đường nào token hỗ trợ — tài khoản dạng [IMAP/POP3/Graph] hay [GRAPH API] đều chạy; ép 1 đường bằng `--otp-method imap` hoặc `--otp-method graph`.
+   - **Chỉ hỗ trợ email Outlook** (domain `outlook.*` như outlook.com, outlook.fr): tài khoản Hotmail/Live/MSN trong file đầu vào sẽ bị lọc bỏ.
    - Tự điền OTP bằng mô phỏng thao tác gõ tự nhiên (`press_sequentially`).
    - Tự động hoàn tất thông tin Profile (Họ tên, ngày sinh) hoặc điền mật khẩu nếu tài khoản Meta đã tồn tại.
 
@@ -60,6 +61,7 @@ Chuẩn bị file tài khoản dạng văn bản `accounts.txt` (tham khảo `ac
 email|password|refresh_token|client_id
 ```
 > Trong đó `client_id` mặc định của Mozilla Thunderbird OAuth2 là: `9e5f94bc-e8a4-4e73-b8be-63364c29d753`.
+> Chỉ dùng email **Outlook** (`outlook.*`) — Hotmail không được hỗ trợ.
 
 ---
 
@@ -105,14 +107,15 @@ python auto_register_pool.py --file accounts.txt \
 
 ### Lấy nhanh mã OTP Meta từ Terminal:
 ```bash
-python get_meta_otp.py your_account@hotmail.com
+python get_meta_otp.py your_account@outlook.com
+python get_meta_otp.py --method graph your_account@outlook.com   # ép đọc qua Graph (auto|imap|graph)
 ```
 
 ### Khởi chạy máy chủ Webmail xem OTP trên trình duyệt:
 ```bash
 python webmail_otp_server.py
 ```
-Truy cập: `http://localhost:8765/mail/?email=your_account@hotmail.com`
+Truy cập: `http://localhost:8765/mail/?email=your_account@outlook.com`
 
 ---
 

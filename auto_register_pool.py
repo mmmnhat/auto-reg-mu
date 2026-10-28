@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Tool tự động đăng ký tài khoản Muse AI (Meta) hàng loạt từ file Hotmail OAuth2,
+"""Tool tự động đăng ký tài khoản Muse AI (Meta) hàng loạt từ file Outlook OAuth2 (đọc OTP qua IMAP XOAUTH2 + Microsoft Graph),
 hỗ trợ xoay Proxy / 4G, phân loại triệt để 3 nhóm (Thành Công, Chờ Duyệt Waitlist, Thất Bại),
 và tự động nạp thẳng tài khoản hợp lệ vào Pool muse2api.
 
@@ -33,6 +33,8 @@ try:
 except ImportError:
     print("[!] Cần cài đặt Playwright: .venv/bin/pip install playwright")
     sys.exit(1)
+
+from otp_mail import is_outlook_email, poll_meta_otp
 
 
 def parse_name_from_email(email_addr: str) -> Tuple[str, str]:
@@ -79,122 +81,6 @@ def parse_proxy(proxy_str: Optional[str]) -> Optional[Dict[str, str]]:
         return {"server": f"http://{parts[0]}:{parts[1]}"}
 
     return {"server": p}
-
-
-def poll_meta_otp(email_addr: str, refresh_token: str, client_id: str, start_timestamp: float, timeout: int = 120) -> Optional[str]:
-    """Kết nối Hotmail IMAP XOAUTH2 và quét mã OTP 6 chữ số từ Meta trong khoảng thời gian timeout."""
-    token_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-    token_data = urllib.parse.urlencode({
-        "client_id": client_id,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }).encode("utf-8")
-
-    access_token = None
-    try:
-        req = urllib.request.Request(token_url, data=token_data, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            access_token = data.get("access_token")
-    except Exception as e:
-        print(f"    [!] Lỗi đổi OAuth2 access token cho {email_addr}: {e}")
-        return None
-
-    if not access_token:
-        return None
-
-    auth_string = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01".encode("utf-8")
-    mail = None
-    try:
-        mail = imaplib.IMAP4_SSL("outlook.office365.com", 993, timeout=25)
-        mail.authenticate("XOAUTH2", lambda x: auth_string)
-    except Exception as e:
-        print(f"    [!] Lỗi kết nối IMAP XOAUTH2 {email_addr}: {e}")
-        if mail:
-            try:
-                mail.logout()
-            except Exception:
-                pass
-        return None
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for folder in ["Inbox", "Junk"]:
-            try:
-                status, _ = mail.select(folder)
-                if status != "OK":
-                    continue
-                status, messages = mail.search(None, "ALL")
-                if status != "OK" or not messages or not messages[0]:
-                    continue
-                mids = messages[0].split()
-                if not mids:
-                    continue
-
-                # Quét các thư mới nhất
-                for mid in reversed(mids[-5:]):
-                    res, msg_data = mail.fetch(mid, "(RFC822)")
-                    if res != "OK" or not msg_data or not msg_data[0]:
-                        continue
-                    msg = email.message_from_bytes(msg_data[0][1])
-                    frm = str(msg.get("From", ""))
-                    subj = str(msg.get("Subject", ""))
-                    date_str = str(msg.get("Date", ""))
-
-                    # Bỏ qua các email cũ hơn thời điểm bắt đầu yêu cầu OTP (cho phép chênh lệch tối đa 30s)
-                    if date_str:
-                        try:
-                            msg_dt = email.utils.parsedate_to_datetime(date_str).timestamp()
-                            if msg_dt < (start_timestamp - 30):
-                                continue
-                        except Exception:
-                            pass
-
-                    if any(k in frm or k in subj for k in ["Meta", "meta.com", "Xác nhận", "Confirm", "code", "Mã"]):
-                        raw_content = ""
-                        for part in msg.walk():
-                            if part.get_content_type() in ["text/html", "text/plain"]:
-                                payload = part.get_payload(decode=True)
-                                if payload:
-                                    raw_content += payload.decode(errors="ignore")
-
-                        # Mẫu 1: "Mã xác nhận 123456"
-                        m = re.search(r"Mã xác nhận[:\s]+(\d{6})", raw_content)
-                        if m:
-                            try: mail.logout()
-                            except Exception: pass
-                            return m.group(1)
-
-                        # Mẫu 2: HTML letter-spacing hoặc font-size của Meta email
-                        m2 = re.search(r"letter-spacing:[^>]*>(\d{6})<", raw_content)
-                        if m2:
-                            try: mail.logout()
-                            except Exception: pass
-                            return m2.group(1)
-
-                        # Mẫu 3: "is your Meta confirmation code"
-                        m3 = re.search(r"(\d{6})\s+is your Meta", raw_content)
-                        if m3:
-                            try: mail.logout()
-                            except Exception: pass
-                            return m3.group(1)
-
-                        # Mẫu 4: Mọi chuỗi 6 chữ số hợp lệ
-                        candidates = re.findall(r"\b\d{6}\b", raw_content)
-                        for code in candidates:
-                            if code not in ("141823", "000000", "123456"):
-                                try: mail.logout()
-                                except Exception: pass
-                                return code
-            except Exception:
-                pass
-        time.sleep(3)
-
-    try:
-        mail.logout()
-    except Exception:
-        pass
-    return None
 
 
 def upload_to_muse2api(base_url: str, api_key: str, label: str, cookies: Dict[str, str], cookies_exp: Dict[str, int]) -> bool:
@@ -335,7 +221,8 @@ async def register_single_account(
     muse2api_key: str = "",
     out_dir: str = ".",
     headless: bool = True,
-    verify_video: bool = True
+    verify_video: bool = True,
+    otp_method: str = "auto"
 ) -> Dict:
     """Quy trình đăng ký 1 tài khoản Muse AI tự động bằng Playwright Chrome."""
     email_addr = acc_data["email"].strip()
@@ -346,6 +233,13 @@ async def register_single_account(
     first_name, last_name = parse_name_from_email(email_addr)
     print(f"\n==================================================")
     print(f"[*] Bắt đầu xử lý: {email_addr} ({first_name} {last_name})")
+
+    # CHỈ DÙNG OUTLOOK: bỏ qua Hotmail/Live/MSN
+    if not is_outlook_email(email_addr):
+        print("  [!] Không phải email Outlook (chỉ hỗ trợ outlook.*) -> Bỏ qua!")
+        res = {"email": email_addr, "status": "failed", "reason": "not_outlook"}
+        save_record(out_dir, acc_data, res)
+        return res
 
     launch_args = {
         "headless": headless,
@@ -416,11 +310,11 @@ async def register_single_account(
             submit_btn = page.locator('button[type="submit"], button:has-text("Tiếp tục"), button:has-text("Continue")').first
             start_ts = time.time()
             await submit_btn.click()
-            print("  2. Đã bấm gửi email. Bắt đầu quét mã OTP từ Hotmail qua IMAP XOAUTH2...")
+            print(f"  2. Đã bấm gửi email. Bắt đầu quét mã OTP từ Outlook (method={otp_method}: IMAP + Graph)...")
 
-            # Quét OTP từ Hotmail qua IMAP XOAUTH2
+            # Quét OTP từ Outlook: IMAP XOAUTH2 + Microsoft Graph (theo otp_method)
             loop = asyncio.get_running_loop()
-            otp = await loop.run_in_executor(None, poll_meta_otp, email_addr, refresh_token, client_id, start_ts, 120)
+            otp = await loop.run_in_executor(None, lambda: poll_meta_otp(email_addr, refresh_token, client_id, start_ts, 120, otp_method))
             if not otp:
                 print("  [!] Hết thời gian chờ OTP (120s) không nhận được mail từ Meta!")
                 await browser.close()
@@ -677,6 +571,7 @@ async def main():
     parser.add_argument("--start", type=int, default=0, help="Vị trí bắt đầu trong file (0-indexed)")
     parser.add_argument("--force", action="store_true", help="Bỏ qua kiểm tra tài khoản đã thành công, chạy lại từ đầu")
     parser.add_argument("--no-verify-video", action="store_true", help="Bỏ qua bước gửi lệnh tạo video vẫy tay để xác thực quyền")
+    parser.add_argument("--otp-method", choices=["auto", "imap", "graph"], default=os.environ.get("MUSE_OTP_METHOD", "auto"), help="Đường đọc OTP: auto = cả IMAP + Graph (mặc định), imap = chỉ IMAP XOAUTH2, graph = chỉ Microsoft Graph")
     args = parser.parse_args()
 
     if not os.path.isfile(args.file):
@@ -697,6 +592,12 @@ async def main():
                     "refresh_token": parts[2].strip(),
                     "client_id": parts[3].strip(),
                 })
+
+    # CHỈ DÙNG OUTLOOK: lọc bỏ Hotmail/Live/MSN khỏi danh sách
+    total_read = len(accounts)
+    accounts = [a for a in accounts if is_outlook_email(a["email"])]
+    if total_read != len(accounts):
+        print(f"[!] Đã lọc bỏ {total_read - len(accounts)} tài khoản không phải Outlook (chỉ hỗ trợ outlook.*)")
 
     print(f"[*] Tổng số tài khoản đọc được: {len(accounts)}")
     selected = accounts[args.start : args.start + args.limit]
@@ -747,7 +648,8 @@ async def main():
             muse2api_key=args.key,
             out_dir=args.out_dir,
             headless=not args.head,
-            verify_video=not args.no_verify_video
+            verify_video=not args.no_verify_video,
+            otp_method=args.otp_method
         )
         await asyncio.sleep(2)
 

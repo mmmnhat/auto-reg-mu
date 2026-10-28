@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Tool CLI lấy mã OTP từ Meta nhanh cho một email bất kỳ trong file.
+"""Tool CLI lấy mã OTP từ Meta nhanh cho một email Outlook bất kỳ trong file.
+
+Đọc OTP qua cả IMAP XOAUTH2 và Microsoft Graph (module otp_mail dùng chung).
+CHỈ hỗ trợ email Outlook (outlook.*) — khớp với auto_register_pool.py.
 
 Cách dùng:
-    python get_meta_otp.py user@hotmail.com
-    python get_meta_otp.py --file accounts.txt user@hotmail.com
+    python get_meta_otp.py user@outlook.com
+    python get_meta_otp.py --file accounts.txt user@outlook.com
+    python get_meta_otp.py --method graph user@outlook.com   # ép 1 đường: auto|imap|graph
 """
 
 import argparse
-import email
-import imaplib
-import json
 import os
-import re
 import sys
-import time
-import urllib.parse
-import urllib.request
+
+from otp_mail import is_outlook_email, poll_meta_otp_detailed
 
 
 def find_account(email_query: str, filepath: str):
@@ -39,85 +38,13 @@ def find_account(email_query: str, filepath: str):
     return None
 
 
-def get_otp(acc):
-    token_url = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-    token_data = urllib.parse.urlencode({
-        "client_id": acc["client_id"],
-        "grant_type": "refresh_token",
-        "refresh_token": acc["refresh_token"],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(token_url, data=token_data, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            access_token = data.get("access_token")
-    except Exception as e:
-        print(f"[!] Lỗi đổi OAuth2 access token: {e}")
-        return None, None, None
-
-    auth_string = f"user={acc['email']}\x01auth=Bearer {access_token}\x01\x01".encode("utf-8")
-    try:
-        mail = imaplib.IMAP4_SSL("outlook.office365.com", 993, timeout=15)
-        mail.authenticate("XOAUTH2", lambda x: auth_string)
-    except Exception as e:
-        print(f"[!] Lỗi kết nối IMAP XOAUTH2: {e}")
-        return None, None, None
-
-    print(f"[*] Đang quét hòm thư {acc['email']}...")
-    for folder in ["Inbox", "Junk"]:
-        try:
-            status, _ = mail.select(folder)
-            if status != "OK":
-                continue
-            status, messages = mail.search(None, "ALL")
-            mids = messages[0].split()
-            for mid in reversed(mids[-4:]):
-                res, msg_data = mail.fetch(mid, "(RFC822)")
-                if res != "OK" or not msg_data or not msg_data[0]:
-                    continue
-                msg = email.message_from_bytes(msg_data[0][1])
-                frm = msg.get("From", "")
-                subj = msg.get("Subject", "")
-
-                if any(k in frm or k in subj for k in ["Meta", "meta.com", "Xác nhận", "Confirm", "code", "Mã"]):
-                    raw_content = ""
-                    for part in msg.walk():
-                        if part.get_content_type() in ["text/html", "text/plain"]:
-                            raw_content += part.get_payload(decode=True).decode(errors="ignore")
-
-                    m = re.search(r"Mã xác nhận\s+(\d{6})", raw_content)
-                    if m:
-                        try: mail.logout()
-                        except Exception: pass
-                        return m.group(1), frm, subj
-
-                    m2 = re.search(r"letter-spacing:[^>]*>(\d{6})<", raw_content)
-                    if m2:
-                        try: mail.logout()
-                        except Exception: pass
-                        return m2.group(1), frm, subj
-
-                    candidates = re.findall(r"\b\d{6}\b", raw_content)
-                    for c in candidates:
-                        if c not in ("141823", "000000", "123456"):
-                            try: mail.logout()
-                            except Exception: pass
-                            return c, frm, subj
-        except Exception:
-            pass
-
-    try:
-        mail.logout()
-    except Exception:
-        pass
-    return None, None, None
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Tool CLI lấy mã OTP từ Meta nhanh cho một Hotmail bất kỳ.")
+    parser = argparse.ArgumentParser(description="Tool CLI lấy mã OTP từ Meta nhanh cho một Outlook bất kỳ (IMAP + Graph).")
     parser.add_argument("email", help="Email cần lấy OTP")
     parser.add_argument("--file", default=os.environ.get("MUSE_ACCOUNTS_FILE", "accounts.txt"), help="File txt danh sách acc")
+    parser.add_argument("--method", choices=["auto", "imap", "graph"], default=os.environ.get("MUSE_OTP_METHOD", "auto"),
+                        help="Đường đọc OTP: auto = cả IMAP + Graph (mặc định), imap, graph")
+    parser.add_argument("--timeout", type=int, default=30, help="Số giây chờ quét thư (mặc định 30)")
     args = parser.parse_args()
 
     acc = find_account(args.email, args.file)
@@ -125,16 +52,23 @@ def main():
         print(f"[!] Không tìm thấy tài khoản khớp với: '{args.email}' trong {args.file}")
         sys.exit(1)
 
+    if not is_outlook_email(acc["email"]):
+        print(f"[!] '{acc['email']}' không phải email Outlook — tool chỉ hỗ trợ outlook.* (bỏ qua Hotmail/Live/MSN).")
+        sys.exit(1)
+
     print(f"[✓] Tìm thấy tài khoản: {acc['email']}")
-    otp, frm, subj = get_otp(acc)
-    if otp:
+    print(f"[*] Đang quét hòm thư (method={args.method}: IMAP + Graph)...")
+    # start_timestamp=0: lấy cả thư OTP đã có sẵn trong hộp thư, không chỉ thư mới
+    hit = poll_meta_otp_detailed(acc["email"], acc["refresh_token"], acc["client_id"], 0, args.timeout, args.method)
+    if hit:
+        otp, frm, subj = hit
         print("\n" + "=" * 40)
         print(f"👉 MÃ OTP META:  {otp}")
         print("=" * 40)
         print(f"Từ:      {frm}")
         print(f"Tiêu đề: {subj}")
     else:
-        print("\n[!] Không tìm thấy thư OTP mới từ Meta trong Inbox và Junk.")
+        print("\n[!] Không tìm thấy thư OTP mới từ Meta trong Inbox và Junk (cả IMAP lẫn Graph).")
 
 
 if __name__ == "__main__":
