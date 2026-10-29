@@ -24,12 +24,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import email
+import hashlib
 import imaplib
 import json
 import os
+import random
 import re
 import secrets
+import shutil
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -46,17 +50,64 @@ from otp_mail import is_outlook_email, poll_meta_otp
 # Khóa đồng bộ ghi file tránh xung đột khi chạy đa luồng
 _FILE_LOCK = asyncio.Lock()
 
+# Danh sách User-Agents thực tế và Viewport chuẩn để ngẫu nhiên hóa profile chống chết chùm
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+]
+
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1680, "height": 1050},
+    {"width": 1366, "height": 768},
+]
+
+
+POPULAR_LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones",
+    "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+    "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez",
+    "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young",
+    "Allen", "King", "Wright", "Scott", "Torres", "Nguyen",
+    "Hill", "Flores", "Green", "Adams", "Nelson", "Baker",
+    "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts"
+]
+
 
 def parse_name_from_email(email_addr: str) -> Tuple[str, str]:
-    """Tách tên và họ từ email dạng AdrianceMadie870@hotmail.com"""
+    """Tách tên và họ tự nhiên từ email, tuyệt đối không dùng AI, Bot, hay User."""
     username = email_addr.split("@")[0]
-    clean = re.sub(r"\d+", "", username)
+    clean = re.sub(r"\d+", "", username).strip()
+    if not clean:
+        clean = "Alex"
+
+    # Trường hợp 1: Có chữ in hoa dạng CamelCase (vd: AdrianceMadie870)
     parts = re.findall(r"[A-Z][a-z]*", clean)
     if len(parts) >= 2:
-        return parts[0], parts[1]
-    elif len(parts) == 1:
-        return parts[0], "User"
-    return username[:6].capitalize(), "AI"
+        return parts[0].capitalize(), parts[1].capitalize()
+    elif len(parts) == 1 and len(clean) > len(parts[0]):
+        rest = clean[len(parts[0]):].strip()
+        if len(rest) >= 3:
+            return parts[0].capitalize(), rest.capitalize()
+
+    # Trường hợp 2: Toàn chữ thường (vd: askarisharnelle -> Askari Sharnelle)
+    if len(clean) >= 8:
+        half = len(clean) // 2
+        first = clean[:half].capitalize()
+        last = clean[half:].capitalize()
+        return first, last
+
+    # Trường hợp 3: Chuỗi ngắn, ghép họ phổ biến ngẫu nhiên theo hash email
+    first = clean.capitalize()
+    idx = int(hashlib.md5(email_addr.encode()).hexdigest(), 16) % len(POPULAR_LAST_NAMES)
+    last = POPULAR_LAST_NAMES[idx]
+    return first, last
 
 
 def parse_proxy(proxy_str: Optional[str]) -> Optional[Dict[str, str]]:
@@ -314,14 +365,29 @@ async def register_single_account(
         await save_record_async(out_dir, acc_data, res)
         return res
 
+    email_hash = hashlib.md5(email_addr.encode()).hexdigest()[:8]
+    profile_dir = tempfile.mkdtemp(prefix=f"muse_prof_{email_hash}_")
+
+    chosen_ua = random.choice(USER_AGENTS)
+    chosen_vp = random.choice(VIEWPORTS)
+    is_mac = "Macintosh" in chosen_ua
+    platform_name = "MacIntel" if is_mac else "Win32"
+
     launch_args = {
+        "user_data_dir": profile_dir,
         "headless": headless,
+        "user_agent": chosen_ua,
+        "viewport": chosen_vp,
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-infobars",
-            "--window-size=1280,800",
+            f"--window-size={chosen_vp['width']},{chosen_vp['height']}",
+            "--no-first-run",
+            "--no-default-browser-check",
         ],
         "ignore_default_args": ["--enable-automation"]
     }
@@ -331,23 +397,56 @@ async def register_single_account(
         launch_args["proxy"] = proxy_cfg
         user_info = f" (User: {proxy_cfg.get('username')})" if 'username' in proxy_cfg else ""
         print(f"  -> Sử dụng Proxy: {proxy_cfg['server']}{user_info}")
+    print(f"  -> Khởi tạo Profile sạch riêng biệt: {profile_dir} (UA: {chosen_ua.split('Chrome/')[1].split()[0] if 'Chrome/' in chosen_ua else 'Custom'})")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_args)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        # Ẩn cờ webdriver automation để qua mặt Meta Bot Detection
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            window.chrome = {
-                runtime: {}
-            };
+        context = await p.chromium.launch_persistent_context(**launch_args)
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        # Ẩn cờ webdriver automation và spoof fingerprint nâng cao chống chết chùm Meta
+        await context.add_init_script(f"""
+            // 1. Xóa cờ webdriver
+            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+            
+            // 2. Mock chrome runtime chuẩn
+            window.chrome = {{
+                runtime: {{}},
+                app: {{ isInstalled: false }},
+                csi: () => {{}},
+                loadTimes: () => {{}}
+            }};
+
+            // 3. Mock languages & platform
+            Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+            Object.defineProperty(navigator, 'platform', {{ get: () => '{platform_name}' }});
+            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+
+            // 4. Spoof WebGL vendor & renderer
+            const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParameterOrig.apply(this, arguments);
+            }};
+            if (typeof WebGL2RenderingContext !== 'undefined') {{
+                const getParameterOrig2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
+                    if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+                    if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                    return getParameterOrig2.apply(this, arguments);
+                }};
+            }}
+
+            // 5. Canvas micro-noise để mỗi profile có Canvas Fingerprint tự nhiên và độc nhất
+            const getImageDataOrig = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {{
+                const res = getImageDataOrig.apply(this, arguments);
+                for (let i = 0; i < res.data.length; i += 40) {{
+                    res.data[i] = res.data[i] ^ 1;
+                }}
+                return res;
+            }};
         """)
 
         # Tối ưu hóa tải trang: Chặn fonts và tracking rác giúp tăng tốc và tiết kiệm băng thông proxy
@@ -360,8 +459,6 @@ async def register_single_account(
             await route.continue_()
 
         await context.route("**/*", intercept_route)
-
-        page = await context.new_page()
 
         try:
             print("  1. Mở https://muse.ai (chờ tải trang hoàn chỉnh)...")
@@ -398,7 +495,7 @@ async def register_single_account(
 
             if await email_input.count() == 0 or not await email_input.is_visible():
                 print("  [!] Không tìm thấy ô nhập email trên màn hình!")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "no_email_input"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -445,7 +542,7 @@ async def register_single_account(
                 body_text = await page.locator("body").inner_text()
                 body_snippet = " ".join(body_text.split())[:250]
                 print(f"  [!] Không xuất hiện ô OTP sau khi gửi email. Nội dung: {body_snippet}")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "otp_screen_missing"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -457,7 +554,7 @@ async def register_single_account(
             otp = await loop.run_in_executor(None, lambda: poll_meta_otp(email_addr, refresh_token, client_id, start_ts, 120, otp_method))
             if not otp:
                 print("  [!] Hết thời gian chờ OTP (120s) không nhận được mail từ Meta!")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "otp_timeout"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -487,7 +584,7 @@ async def register_single_account(
                     break
                 if state == "rejected":
                     print("  [!] Phát hiện Meta từ chối đăng ký (IP bị cờ / Registration Rejected)!")
-                    await browser.close()
+                    await context.close()
                     res = {"email": email_addr, "status": "failed", "reason": "meta_registration_rejected", "url": page.url}
                     await save_record_async(out_dir, acc_data, res)
                     return res
@@ -696,15 +793,24 @@ async def register_single_account(
                 }
 
             await save_record_async(out_dir, acc_data, res)
-            await browser.close()
+            await context.close()
             return res
 
         except Exception as e:
             print(f"  [!] Ngoại lệ trong quá trình đăng ký: {e}")
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
             res = {"email": email_addr, "status": "failed", "reason": str(e)}
             await save_record_async(out_dir, acc_data, res)
             return res
+        finally:
+            # Dọn dẹp sạch sẽ profile tạm sau khi hoàn tất để bảo vệ tài nguyên ổ cứng
+            try:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def trigger_ip_rotate(rotate_url: str, wait_secs: int = 5):
