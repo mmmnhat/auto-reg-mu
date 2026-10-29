@@ -316,7 +316,7 @@ def poll_meta_otp_detailed(
                 if hit:
                     print("    [✓] Lấy OTP qua Microsoft Graph")
                     return hit
-            time.sleep(3)
+            time.sleep(1.2)
     finally:
         if mail:
             try:
