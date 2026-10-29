@@ -685,18 +685,21 @@ async def register_single_account(
             if verify_video and has_sess and not is_waitlist:
                 print("  6. Kiểm tra quyền hạn thực tế: Mở phòng chat và gửi lệnh tạo video 'Muse vẫy tay'...")
                 try:
-                    await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
+                    try:
+                        await page.goto("https://muse.ai/thread/new", wait_until="networkidle", timeout=25000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.0)
 
                     # Xử lý màn hình điều khoản giới thiệu /access/disclosure ("A few things to know")
-                    if "/access" in page.url:
-                        get_started_btn = page.locator('button:has-text("Get started"), button:has-text("Bắt đầu")').first
-                        if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
-                            print("  -> Phát hiện màn hình Điều khoản Giới thiệu ('Get started')! Đang bấm xác nhận để vào Chat...")
-                            try:
-                                await get_started_btn.click(timeout=3000)
-                                await asyncio.sleep(2.5)
-                            except Exception:
-                                pass
+                    get_started_btn = page.locator('button:has-text("Get started"), button:has-text("Bắt đầu"), button[type="submit"]').first
+                    if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
+                        print("  -> Phát hiện màn hình Điều khoản Giới thiệu ('Get started')! Đang bấm xác nhận để vào Chat...")
+                        try:
+                            await get_started_btn.click(timeout=3000)
+                            await asyncio.sleep(3.0)
+                        except Exception:
+                            pass
 
                     if "/access" in page.url and await page.locator('textarea').count() == 0:
                         access_text = " ".join((await page.locator("body").inner_text()).split())[:250]
