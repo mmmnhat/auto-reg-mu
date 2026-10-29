@@ -678,7 +678,7 @@ async def register_single_account(
 
             has_sess = "hatch_sess" in cookies_dict
             has_vml = "hatch_vml" in cookies_dict
-            is_waitlist = "/access" in current_url
+            is_waitlist = False
 
             # BƯỚC 6: XÁC THỰC THỰC TẾ BẰNG LỆNH TẠO VIDEO "MUSE VẪY TAY"
             video_verified = False
@@ -687,7 +687,18 @@ async def register_single_account(
                 try:
                     await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
 
+                    # Xử lý màn hình điều khoản giới thiệu /access/disclosure ("A few things to know")
                     if "/access" in page.url:
+                        get_started_btn = page.locator('button:has-text("Get started"), button:has-text("Bắt đầu")').first
+                        if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
+                            print("  -> Phát hiện màn hình Điều khoản Giới thiệu ('Get started')! Đang bấm xác nhận để vào Chat...")
+                            try:
+                                await get_started_btn.click(timeout=3000)
+                                await asyncio.sleep(2.5)
+                            except Exception:
+                                pass
+
+                    if "/access" in page.url and await page.locator('textarea').count() == 0:
                         access_text = " ".join((await page.locator("body").inner_text()).split())[:250]
                         print(f"  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)! Nội dung: {access_text}")
                         is_waitlist = True
