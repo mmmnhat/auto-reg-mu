@@ -24,12 +24,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import email
+import hashlib
 import imaplib
 import json
 import os
+import random
 import re
 import secrets
+import shutil
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -46,17 +50,64 @@ from otp_mail import is_outlook_email, poll_meta_otp
 # Khóa đồng bộ ghi file tránh xung đột khi chạy đa luồng
 _FILE_LOCK = asyncio.Lock()
 
+# Danh sách User-Agents thực tế và Viewport chuẩn để ngẫu nhiên hóa profile chống chết chùm
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+]
+
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1680, "height": 1050},
+    {"width": 1366, "height": 768},
+]
+
+
+POPULAR_LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones",
+    "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+    "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez",
+    "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young",
+    "Allen", "King", "Wright", "Scott", "Torres", "Nguyen",
+    "Hill", "Flores", "Green", "Adams", "Nelson", "Baker",
+    "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts"
+]
+
 
 def parse_name_from_email(email_addr: str) -> Tuple[str, str]:
-    """Tách tên và họ từ email dạng AdrianceMadie870@hotmail.com"""
+    """Tách tên và họ tự nhiên từ email, tuyệt đối không dùng AI, Bot, hay User."""
     username = email_addr.split("@")[0]
-    clean = re.sub(r"\d+", "", username)
+    clean = re.sub(r"\d+", "", username).strip()
+    if not clean:
+        clean = "Alex"
+
+    # Trường hợp 1: Có chữ in hoa dạng CamelCase (vd: AdrianceMadie870)
     parts = re.findall(r"[A-Z][a-z]*", clean)
     if len(parts) >= 2:
-        return parts[0], parts[1]
-    elif len(parts) == 1:
-        return parts[0], "User"
-    return username[:6].capitalize(), "AI"
+        return parts[0].capitalize(), parts[1].capitalize()
+    elif len(parts) == 1 and len(clean) > len(parts[0]):
+        rest = clean[len(parts[0]):].strip()
+        if len(rest) >= 3:
+            return parts[0].capitalize(), rest.capitalize()
+
+    # Trường hợp 2: Toàn chữ thường (vd: askarisharnelle -> Askari Sharnelle)
+    if len(clean) >= 8:
+        half = len(clean) // 2
+        first = clean[:half].capitalize()
+        last = clean[half:].capitalize()
+        return first, last
+
+    # Trường hợp 3: Chuỗi ngắn, ghép họ phổ biến ngẫu nhiên theo hash email
+    first = clean.capitalize()
+    idx = int(hashlib.md5(email_addr.encode()).hexdigest(), 16) % len(POPULAR_LAST_NAMES)
+    last = POPULAR_LAST_NAMES[idx]
+    return first, last
 
 
 def parse_proxy(proxy_str: Optional[str]) -> Optional[Dict[str, str]]:
@@ -251,7 +302,7 @@ async def save_record_async(out_dir: str, acc_data: Dict, res: Dict):
         save_record(out_dir, acc_data, res)
 
 
-async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
+async def wait_for_transition(page, context, max_wait: float = 12.0) -> str:
     """Đợi màn hình chuyển trạng thái thông minh: trả về loại màn hình tiếp theo ngay khi render."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
@@ -268,15 +319,21 @@ async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
         if any(k in body_text for k in ["không thể tạo tài khoản", "we couldn't create", "registration rejected", "rejected"]):
             return "rejected"
 
-        # 3. Kiểm tra các form bước tiếp theo
-        if any(k in body_text for k in ["birthday", "ngày sinh", "date of birth"]):
-            return "birthday"
-        if any(k in body_text for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"]):
+        # 3. Kiểm tra các form bước tiếp theo theo selector cụ thể
+        if await page.locator('[data-testid="native-auth-name-fields"], input[name*="first" i], input[placeholder*="first name" i]').count() > 0:
             return "name"
+        if await page.locator('[data-pel-impression="login_birthday_impression"], select[name*="month" i], select[name*="birth" i]').count() > 0:
+            return "birthday"
         if await page.locator('input[type="password"]').count() > 0:
             return "password"
 
-        await asyncio.sleep(0.25)
+        # Fallback text
+        if any(k in body_text for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"]):
+            return "name"
+        if any(k in body_text for k in ["birthday", "ngày sinh", "date of birth"]):
+            return "birthday"
+
+        await asyncio.sleep(0.3)
     return "timeout"
 
 
@@ -308,14 +365,29 @@ async def register_single_account(
         await save_record_async(out_dir, acc_data, res)
         return res
 
+    email_hash = hashlib.md5(email_addr.encode()).hexdigest()[:8]
+    profile_dir = tempfile.mkdtemp(prefix=f"muse_prof_{email_hash}_")
+
+    chosen_ua = random.choice(USER_AGENTS)
+    chosen_vp = random.choice(VIEWPORTS)
+    is_mac = "Macintosh" in chosen_ua
+    platform_name = "MacIntel" if is_mac else "Win32"
+
     launch_args = {
+        "user_data_dir": profile_dir,
         "headless": headless,
+        "user_agent": chosen_ua,
+        "viewport": chosen_vp,
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-infobars",
-            "--window-size=1280,800",
+            f"--window-size={chosen_vp['width']},{chosen_vp['height']}",
+            "--no-first-run",
+            "--no-default-browser-check",
         ],
         "ignore_default_args": ["--enable-automation"]
     }
@@ -325,23 +397,56 @@ async def register_single_account(
         launch_args["proxy"] = proxy_cfg
         user_info = f" (User: {proxy_cfg.get('username')})" if 'username' in proxy_cfg else ""
         print(f"  -> Sử dụng Proxy: {proxy_cfg['server']}{user_info}")
+    print(f"  -> Khởi tạo Profile sạch riêng biệt: {profile_dir} (UA: {chosen_ua.split('Chrome/')[1].split()[0] if 'Chrome/' in chosen_ua else 'Custom'})")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(**launch_args)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        # Ẩn cờ webdriver automation để qua mặt Meta Bot Detection
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            window.chrome = {
-                runtime: {}
-            };
+        context = await p.chromium.launch_persistent_context(**launch_args)
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        # Ẩn cờ webdriver automation và spoof fingerprint nâng cao chống chết chùm Meta
+        await context.add_init_script(f"""
+            // 1. Xóa cờ webdriver
+            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+            
+            // 2. Mock chrome runtime chuẩn
+            window.chrome = {{
+                runtime: {{}},
+                app: {{ isInstalled: false }},
+                csi: () => {{}},
+                loadTimes: () => {{}}
+            }};
+
+            // 3. Mock languages & platform
+            Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+            Object.defineProperty(navigator, 'platform', {{ get: () => '{platform_name}' }});
+            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+
+            // 4. Spoof WebGL vendor & renderer
+            const getParameterOrig = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+                if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParameterOrig.apply(this, arguments);
+            }};
+            if (typeof WebGL2RenderingContext !== 'undefined') {{
+                const getParameterOrig2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
+                    if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+                    if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                    return getParameterOrig2.apply(this, arguments);
+                }};
+            }}
+
+            // 5. Canvas micro-noise để mỗi profile có Canvas Fingerprint tự nhiên và độc nhất
+            const getImageDataOrig = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {{
+                const res = getImageDataOrig.apply(this, arguments);
+                for (let i = 0; i < res.data.length; i += 40) {{
+                    res.data[i] = res.data[i] ^ 1;
+                }}
+                return res;
+            }};
         """)
 
         # Tối ưu hóa tải trang: Chặn fonts và tracking rác giúp tăng tốc và tiết kiệm băng thông proxy
@@ -354,8 +459,6 @@ async def register_single_account(
             await route.continue_()
 
         await context.route("**/*", intercept_route)
-
-        page = await context.new_page()
 
         try:
             print("  1. Mở https://muse.ai (chờ tải trang hoàn chỉnh)...")
@@ -392,7 +495,7 @@ async def register_single_account(
 
             if await email_input.count() == 0 or not await email_input.is_visible():
                 print("  [!] Không tìm thấy ô nhập email trên màn hình!")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "no_email_input"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -409,23 +512,27 @@ async def register_single_account(
 
             submit_btn = page.locator('button:has-text("Continue"), button:has-text("Tiếp tục"), button[type="submit"]').first
             start_ts = time.time()
-            try:
-                if await submit_btn.count() > 0 and await submit_btn.is_visible():
-                    await submit_btn.click(timeout=2500)
-                else:
-                    await email_input.press("Enter")
-            except Exception:
+            submitted = False
+            for _ in range(10):
+                if await submit_btn.count() > 0 and await submit_btn.is_visible() and not await submit_btn.is_disabled():
+                    await submit_btn.click(force=True)
+                    submitted = True
+                    break
+                await asyncio.sleep(0.3)
+            if not submitted:
                 await email_input.press("Enter")
 
             # Đảm bảo trang đã submit sang màn hình OTP (chờ 25s cho mạng proxy)
             otp_input = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"], input[maxlength="6"]').first
             is_otp_screen = False
             try:
-                await otp_input.wait_for(state="attached", timeout=25000)
+                await otp_input.wait_for(state="attached", timeout=15000)
                 is_otp_screen = True
             except Exception:
                 try:
-                    await page.keyboard.press("Enter")
+                    await email_input.press("Enter")
+                    if await submit_btn.count() > 0 and await submit_btn.is_visible() and not await submit_btn.is_disabled():
+                        await submit_btn.click(force=True)
                     await otp_input.wait_for(state="attached", timeout=10000)
                     is_otp_screen = True
                 except Exception:
@@ -435,7 +542,7 @@ async def register_single_account(
                 body_text = await page.locator("body").inner_text()
                 body_snippet = " ".join(body_text.split())[:250]
                 print(f"  [!] Không xuất hiện ô OTP sau khi gửi email. Nội dung: {body_snippet}")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "otp_screen_missing"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -447,7 +554,7 @@ async def register_single_account(
             otp = await loop.run_in_executor(None, lambda: poll_meta_otp(email_addr, refresh_token, client_id, start_ts, 120, otp_method))
             if not otp:
                 print("  [!] Hết thời gian chờ OTP (120s) không nhận được mail từ Meta!")
-                await browser.close()
+                await context.close()
                 res = {"email": email_addr, "status": "failed", "reason": "otp_timeout"}
                 await save_record_async(out_dir, acc_data, res)
                 return res
@@ -460,33 +567,65 @@ async def register_single_account(
             await otp_input.focus()
             await page.keyboard.type(otp, delay=40)
 
-            # Sau khi gõ đủ 6 ký tự OTP, form tự động submit hoặc bấm Confirm nếu còn
+            # Sau khi gõ đủ 6 ký tự OTP, form tự động submit hoặc bấm Continue/Confirm nếu còn
             await asyncio.sleep(1.0)
             try:
-                confirm_otp_btn = page.locator('button:has-text("Confirm"), button:has-text("Xác nhận")').first
+                confirm_otp_btn = page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("Tiếp tục"), button:has-text("Confirm"), button:has-text("Xác nhận")').first
                 if await confirm_otp_btn.count() > 0 and await confirm_otp_btn.is_visible() and not await confirm_otp_btn.is_disabled():
-                    print("  -> Bấm nút Xác nhận OTP...")
+                    print("  -> Bấm nút Tiếp tục/Xác nhận OTP...")
                     await confirm_otp_btn.click(timeout=3000)
             except Exception:
                 pass
 
             # Xử lý thông minh các màn hình thiết lập hồ sơ Meta sau khi nhập OTP (Ngày sinh, Họ tên, Mật khẩu...)
-            for step_idx in range(1, 5):
-                state = await wait_for_transition(page, context, max_wait=6.0)
+            for step_idx in range(1, 6):
+                state = await wait_for_transition(page, context, max_wait=12.0)
                 if state == "authenticated" or "/access" in page.url:
                     break
                 if state == "rejected":
                     print("  [!] Phát hiện Meta từ chối đăng ký (IP bị cờ / Registration Rejected)!")
-                    await browser.close()
+                    await context.close()
                     res = {"email": email_addr, "status": "failed", "reason": "meta_registration_rejected", "url": page.url}
                     await save_record_async(out_dir, acc_data, res)
                     return res
 
+                if state == "timeout":
+                    # Xem xét nếu nút Confirm OTP vẫn còn trên màn hình
+                    confirm_btn = page.locator('button:has-text("Confirm"), button:has-text("Xác nhận")').first
+                    if await confirm_btn.count() > 0 and await confirm_btn.is_visible():
+                        try:
+                            await confirm_btn.click(force=True)
+                            await asyncio.sleep(1.0)
+                            continue
+                        except Exception:
+                            pass
+                    b_txt = " ".join((await page.locator("body").inner_text()).split())[:200]
+                    print(f"  [!] Chờ bước {step_idx} timeout (nội dung trang: {b_txt})")
+                    break
+
                 acted = False
                 cur_body = (await page.locator("body").inner_text()).lower()
 
-                # 1. Màn hình Ngày sinh (Birthday)
-                if state == "birthday" or any(k in cur_body for k in ["birthday", "ngày sinh", "date of birth"]):
+                # 1. Màn hình Họ tên (Name)
+                is_name_screen = (
+                    state == "name"
+                    or await page.locator('[data-testid="native-auth-name-fields"]').count() > 0
+                    or await page.locator('input[placeholder*="first name" i], input[name*="first" i]').count() > 0
+                    or any(k in cur_body for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"])
+                )
+                if is_name_screen:
+                    print(f"  4.{step_idx}. Điền họ tên ({first_name} {last_name})...")
+                    name_inputs = await page.locator('[data-testid="native-auth-name-fields"] input, input:not([type="checkbox"]):not([type="hidden"]):not([type="password"])').all()
+                    if len(name_inputs) >= 2:
+                        await name_inputs[0].fill(first_name)
+                        await name_inputs[1].fill(last_name)
+                        acted = True
+                    elif len(name_inputs) == 1:
+                        await name_inputs[0].fill(f"{first_name} {last_name}")
+                        acted = True
+
+                # 2. Màn hình Ngày sinh (Birthday)
+                elif state == "birthday" or await page.locator('[data-pel-impression="login_birthday_impression"]').count() > 0 or any(k in cur_body for k in ["birthday", "ngày sinh", "date of birth"]):
                     print(f"  4.{step_idx}. Điền ngày sinh (15/06/1998)...")
                     try:
                         b_form = page.locator("form").first
@@ -512,15 +651,6 @@ async def register_single_account(
                                 await b_inputs[2].fill("1998")
                                 acted = True
                             except Exception: pass
-
-                # 2. Màn hình Họ tên (Name)
-                elif state == "name" or any(k in cur_body for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"]):
-                    print(f"  4.{step_idx}. Điền họ tên ({first_name} {last_name})...")
-                    name_inputs = await page.locator('input:not([type="checkbox"]):not([type="hidden"]):not([type="password"])').all()
-                    if len(name_inputs) >= 2:
-                        await name_inputs[0].fill(first_name)
-                        await name_inputs[1].fill(last_name)
-                        acted = True
 
                 # 3. Màn hình Mật khẩu (Password)
                 elif state == "password" or await page.locator('input[type="password"]').count() > 0:
@@ -564,7 +694,8 @@ async def register_single_account(
                     await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
 
                     if "/access" in page.url:
-                        print("  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)!")
+                        access_text = " ".join((await page.locator("body").inner_text()).split())[:250]
+                        print(f"  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)! Nội dung: {access_text}")
                         is_waitlist = True
                     else:
                         textarea = page.locator('textarea').first
@@ -662,15 +793,24 @@ async def register_single_account(
                 }
 
             await save_record_async(out_dir, acc_data, res)
-            await browser.close()
+            await context.close()
             return res
 
         except Exception as e:
             print(f"  [!] Ngoại lệ trong quá trình đăng ký: {e}")
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
             res = {"email": email_addr, "status": "failed", "reason": str(e)}
             await save_record_async(out_dir, acc_data, res)
             return res
+        finally:
+            # Dọn dẹp sạch sẽ profile tạm sau khi hoàn tất để bảo vệ tài nguyên ổ cứng
+            try:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def trigger_ip_rotate(rotate_url: str, wait_secs: int = 5):
