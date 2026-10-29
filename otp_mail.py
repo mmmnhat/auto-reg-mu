@@ -170,7 +170,8 @@ def _imap_scan_once(mail, start_timestamp: float) -> Optional[Tuple[str, str, st
                             # Header dạng -0000 (không rõ múi giờ): hiểu là UTC,
                             # tránh lệch theo múi giờ local của máy chạy
                             msg_dt_obj = msg_dt_obj.replace(tzinfo=timezone.utc)
-                        if msg_dt_obj.timestamp() < (start_timestamp - 30):
+                        # Chỉ nhận email đến SAU thời điểm gửi OTP (không lấy OTP cũ)
+                        if msg_dt_obj.timestamp() < start_timestamp:
                             continue
                     except Exception:
                         pass
@@ -240,13 +241,75 @@ def _graph_scan_once(access_token: str, start_timestamp: float) -> Optional[Tupl
             continue
         for msg in data.get("value", []):
             received = _parse_graph_datetime(str(msg.get("receivedDateTime", "")))
-            if received is not None and received < (start_timestamp - 30):
+            # Chỉ nhận email đến SAU thời điểm gửi OTP (không lấy OTP cũ)
+            if received is not None and received < start_timestamp:
                 continue
             sender = (msg.get("from") or {}).get("emailAddress") or {}
             frm = f"{sender.get('name', '')} <{sender.get('address', '')}>"
             subj = str(msg.get("subject", ""))
             body = msg.get("body") or {}
             raw_content = str(body.get("content") or msg.get("bodyPreview") or "")
+            code = extract_meta_otp(frm, subj, subj + "\n" + raw_content)
+            if code:
+                return code, frm, subj
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Outlook REST API v2.0
+# ---------------------------------------------------------------------------
+
+OUTLOOK_REST_BASE = "https://outlook.office.com/api/v2.0"
+OUTLOOK_REST_FOLDERS = ("inbox", "junkemail")
+
+
+def _outlook_rest_request(access_token: str, path: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    url = f"{OUTLOOK_REST_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _outlook_rest_connect(email_addr: str, refresh_token: str, client_id: str) -> Optional[str]:
+    """Lấy token và probe kiểm tra Outlook REST API v2.0."""
+    token = exchange_access_token(refresh_token, client_id)
+    if token:
+        probe = _outlook_rest_request(token, "/me/mailfolders/inbox/messages", {"$top": "1", "$select": "Id"})
+        if probe is not None and "value" in probe:
+            return token
+    return None
+
+
+def _outlook_rest_scan_once(access_token: str, start_timestamp: float) -> Optional[Tuple[str, str, str]]:
+    """Quét 1 vòng inbox + junk qua Outlook REST API v2.0."""
+    params = {
+        "$top": "10",
+        "$orderby": "ReceivedDateTime desc",
+        "$select": "Subject,Body,BodyPreview,ReceivedDateTime,From",
+    }
+    for folder in OUTLOOK_REST_FOLDERS:
+        data = _outlook_rest_request(access_token, f"/me/mailfolders/{folder}/messages", params)
+        if not data:
+            continue
+        for msg in data.get("value", []):
+            received = _parse_graph_datetime(str(msg.get("ReceivedDateTime", "")))
+            # Chỉ nhận email đến SAU thời điểm gửi OTP (không lấy OTP cũ)
+            if received is not None and received < start_timestamp:
+                continue
+            sender = (msg.get("From") or {}).get("EmailAddress") or {}
+            frm = f"{sender.get('Name', '')} <{sender.get('Address', '')}>"
+            subj = str(msg.get("Subject", ""))
+            body = msg.get("Body") or {}
+            raw_content = str(body.get("Content") or msg.get("BodyPreview") or "")
             code = extract_meta_otp(frm, subj, subj + "\n" + raw_content)
             if code:
                 return code, frm, subj
@@ -265,31 +328,33 @@ def poll_meta_otp_detailed(
     timeout: int = 120,
     method: str = "auto",
 ) -> Optional[Tuple[str, str, str]]:
-    """Chờ và lấy OTP Meta qua IMAP và/hoặc Graph.
+    """Chờ và lấy OTP Meta qua IMAP, Microsoft Graph hoặc Outlook REST API.
 
-    method: "auto" (mặc định, cả 2 đường), "imap" hoặc "graph".
-    Trả (otp, from, subject) hoặc None khi hết timeout / cả 2 đường đều không dùng được.
+    method: "auto" (mặc định, thử cả 3 đường), "imap", "graph" hoặc "rest".
+    Trả (otp, from, subject) hoặc None khi hết timeout / không có đường nào dùng được.
     """
     method = (method or "auto").lower()
-    if method not in ("auto", "imap", "graph"):
-        raise ValueError(f"method không hợp lệ: {method!r} (chọn auto|imap|graph)")
+    if method not in ("auto", "imap", "graph", "rest"):
+        raise ValueError(f"method không hợp lệ: {method!r} (chọn auto|imap|graph|rest)")
 
     use_imap = method in ("auto", "imap")
     use_graph = method in ("auto", "graph")
+    use_rest = method in ("auto", "rest")
 
     mail = None
     graph_token: Optional[str] = None
+    rest_token: Optional[str] = None
     errors: List[str] = []
 
-    if use_imap:
-        mail, err = _imap_connect(email_addr, refresh_token, client_id)
-        if mail:
-            print("    [✓] IMAP XOAUTH2: kết nối OK")
+    if use_rest:
+        rest_token = _outlook_rest_connect(email_addr, refresh_token, client_id)
+        if rest_token:
+            print("    [✓] Outlook REST API v2.0: kết nối OK")
         else:
-            errors.append(f"IMAP: {err}")
-            if method == "imap":
-                print(f"    [!] Lỗi kết nối IMAP XOAUTH2 {email_addr}: {err}")
-    if use_graph:
+            errors.append("REST: không truy cập được")
+
+    # Chỉ thử Graph nếu REST không được hoặc người dùng chỉ định rõ
+    if not rest_token and use_graph:
         graph_token = _graph_connect(email_addr, refresh_token, client_id)
         if graph_token:
             print("    [✓] Microsoft Graph: kết nối OK")
@@ -298,23 +363,45 @@ def poll_meta_otp_detailed(
             if method == "graph":
                 print(f"    [!] Graph API không dùng được cho {email_addr} (token thiếu scope Mail.Read?)")
 
-    if not mail and not graph_token:
+    # Chỉ thử IMAP nếu cả REST lẫn Graph đều không được
+    if not rest_token and not graph_token and use_imap:
+        mail, err = _imap_connect(email_addr, refresh_token, client_id)
+        if mail:
+            print("    [✓] IMAP XOAUTH2: kết nối OK")
+        else:
+            errors.append(f"IMAP: {err}")
+            if method == "imap":
+                print(f"    [!] Lỗi kết nối IMAP XOAUTH2 {email_addr}: {err}")
+
+    if not mail and not graph_token and not rest_token:
         if method == "auto":
-            print(f"    [!] Cả IMAP lẫn Graph đều không dùng được cho {email_addr}: {'; '.join(errors)}")
+            print(f"    [!] Cả REST, Graph lẫn IMAP đều không dùng được cho {email_addr}: {'; '.join(errors)}")
         return None
 
     deadline = time.time() + timeout
+    last_heartbeat = 0.0
+    # Dung sai 5 giây cho lệch đồng hồ máy chủ Microsoft vs máy local (chỉ nhận OTP mới)
+    min_ts = start_timestamp - 5.0
     try:
         while time.time() < deadline:
-            if mail:
-                hit = _imap_scan_once(mail, start_timestamp)
+            now = time.time()
+            if now - last_heartbeat >= 6.0:
+                print(f"    ... Đang chờ OTP từ Meta ({int(deadline - now)}s còn lại)")
+                last_heartbeat = now
+            if rest_token:
+                hit = _outlook_rest_scan_once(rest_token, min_ts)
                 if hit:
-                    print("    [✓] Lấy OTP qua IMAP")
+                    print("    [✓] Lấy OTP qua Outlook REST API v2.0")
                     return hit
             if graph_token:
-                hit = _graph_scan_once(graph_token, start_timestamp)
+                hit = _graph_scan_once(graph_token, min_ts)
                 if hit:
                     print("    [✓] Lấy OTP qua Microsoft Graph")
+                    return hit
+            if mail:
+                hit = _imap_scan_once(mail, min_ts)
+                if hit:
+                    print("    [✓] Lấy OTP qua IMAP")
                     return hit
             time.sleep(1.2)
     finally:

@@ -101,10 +101,12 @@ def resolve_proxy_for_worker(base_proxy: Optional[str], session_tag: Optional[st
     if not p:
         return None
 
-    # Tự động gán session ID ngẫu nhiên cho Cliproxy nếu chưa có -sid-
-    if "cliproxy.io" in p and "-sid-" not in p:
+    # Tự động thay thế / gán session ID ngẫu nhiên cho Cliproxy (xoay IP cho từng acc)
+    if "cliproxy.io" in p:
         sid = session_tag or secrets.token_hex(4)
-        if "://" in p:
+        if "-sid-" in p:
+            p = re.sub(r"-sid-[a-zA-Z0-9_]+", f"-sid-{sid}", p)
+        elif "://" in p:
             parsed = urllib.parse.urlparse(p)
             user = parsed.username or ""
             user_with_sid = f"{user}-sid-{sid}-t-10"
@@ -260,6 +262,8 @@ async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
             return "authenticated"
 
         # 2. Kiểm tra rejection dialog
+        if await page.locator('[data-pel-impression*="rejected"], [data-pel-click*="rejected"]').count() > 0:
+            return "rejected"
         body_text = (await page.locator("body").inner_text()).lower()
         if any(k in body_text for k in ["không thể tạo tài khoản", "we couldn't create", "registration rejected", "rejected"]):
             return "rejected"
@@ -315,9 +319,6 @@ async def register_single_account(
         ],
         "ignore_default_args": ["--enable-automation"]
     }
-    chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    if os.path.isfile(chrome_path):
-        launch_args["executable_path"] = chrome_path
 
     proxy_cfg = resolve_proxy_for_worker(proxy_server, session_tag)
     if proxy_cfg:
@@ -347,10 +348,7 @@ async def register_single_account(
         async def intercept_route(route):
             url = route.request.url.lower()
             res_type = route.request.resource_type
-            if any(k in url for k in ("google-analytics.com", "googletagmanager.com", "sentry.io", "datadoghq.com", "connect.facebook.net")):
-                await route.abort()
-                return
-            if res_type == "font":
+            if any(k in url for k in ("google-analytics.com", "googletagmanager.com", "sentry.io", "datadoghq.com")):
                 await route.abort()
                 return
             await route.continue_()
@@ -360,8 +358,21 @@ async def register_single_account(
         page = await context.new_page()
 
         try:
-            print("  1. Mở https://muse.ai ...")
-            await page.goto("https://muse.ai", wait_until="domcontentloaded", timeout=35000)
+            print("  1. Mở https://muse.ai (chờ tải trang hoàn chỉnh)...")
+            try:
+                await page.goto("https://muse.ai", wait_until="networkidle", timeout=25000)
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+            # 1. Tự động đóng popup tải app desktop nếu xuất hiện
+            close_promo = page.locator('button[aria-label="Close"], button[aria-label="close" i], button:has-text("Close")').first
+            if await close_promo.count() > 0 and await close_promo.is_visible():
+                try:
+                    await close_promo.click()
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
 
             # Chờ động ô nhập email
             email_input = page.locator('input[autocomplete*="username"], input[type="email"], input[name="email"], input[placeholder*="email" i], input[placeholder*="di động" i]').first
@@ -386,20 +397,52 @@ async def register_single_account(
                 await save_record_async(out_dir, acc_data, res)
                 return res
 
-            await email_input.click()
-            await email_input.press_sequentially(email_addr, delay=15)
+            if await close_promo.count() > 0 and await close_promo.is_visible():
+                try: await close_promo.click()
+                except Exception: pass
 
-            submit_btn = page.locator('button[type="submit"], button:has-text("Tiếp tục"), button:has-text("Continue")').first
-            try:
-                await submit_btn.wait_for(state="visible", timeout=3000)
-            except Exception:
-                pass
+            await email_input.click(force=True)
+            await page.keyboard.press("Meta+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(email_addr, delay=10)
+            await asyncio.sleep(0.5)
 
+            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Tiếp tục"), button[type="submit"]').first
             start_ts = time.time()
-            await submit_btn.click()
-            print(f"  2. Đã bấm gửi email. Bắt đầu quét mã OTP từ Outlook (method={otp_method}: IMAP + Graph)...")
+            try:
+                if await submit_btn.count() > 0 and await submit_btn.is_visible():
+                    await submit_btn.click(timeout=2500)
+                else:
+                    await email_input.press("Enter")
+            except Exception:
+                await email_input.press("Enter")
 
-            # Quét OTP từ Outlook: IMAP XOAUTH2 + Microsoft Graph (chạy ngầm trong thread pool)
+            # Đảm bảo trang đã submit sang màn hình OTP (chờ 25s cho mạng proxy)
+            otp_input = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"], input[maxlength="6"]').first
+            is_otp_screen = False
+            try:
+                await otp_input.wait_for(state="attached", timeout=25000)
+                is_otp_screen = True
+            except Exception:
+                try:
+                    await page.keyboard.press("Enter")
+                    await otp_input.wait_for(state="attached", timeout=10000)
+                    is_otp_screen = True
+                except Exception:
+                    pass
+
+            if not is_otp_screen:
+                body_text = await page.locator("body").inner_text()
+                body_snippet = " ".join(body_text.split())[:250]
+                print(f"  [!] Không xuất hiện ô OTP sau khi gửi email. Nội dung: {body_snippet}")
+                await browser.close()
+                res = {"email": email_addr, "status": "failed", "reason": "otp_screen_missing"}
+                await save_record_async(out_dir, acc_data, res)
+                return res
+
+            print(f"  2. Đã chuyển sang màn hình OTP. Bắt đầu quét mã OTP từ Outlook (REST API)...")
+
+            # Quét OTP từ Outlook: IMAP XOAUTH2 + Microsoft Graph + REST (chạy ngầm trong thread pool)
             loop = asyncio.get_running_loop()
             otp = await loop.run_in_executor(None, lambda: poll_meta_otp(email_addr, refresh_token, client_id, start_ts, 120, otp_method))
             if not otp:
@@ -410,31 +453,22 @@ async def register_single_account(
                 return res
 
             print(f"  3. Nhận được mã OTP: {otp} -> Đang nhập vào form...")
-            otp_input = page.locator('input[maxlength="6"], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="text"]').first
-            try:
-                await otp_input.wait_for(state="attached", timeout=15000)
-            except Exception:
-                cur_text = await page.locator("body").inner_text()
-                print(f"  [!] Không thấy ô nhập OTP. Nội dung:\n{cur_text[:250]}")
-                await browser.close()
-                res = {"email": email_addr, "status": "failed", "reason": "otp_input_missing"}
-                await save_record_async(out_dir, acc_data, res)
-                return res
-
             try:
                 await otp_input.click(force=True)
             except Exception:
                 pass
             await otp_input.focus()
-            await page.keyboard.type(otp, delay=35)
+            await page.keyboard.type(otp, delay=40)
 
-            # Bấm nút Xác nhận / Submit OTP
-            confirm_otp_btn = page.locator('button[type="submit"], button:has-text("Xác nhận"), button:has-text("Confirm"), button:has-text("Tiếp tục")').first
-            if await confirm_otp_btn.count() > 0 and await confirm_otp_btn.is_visible():
-                print("  -> Bấm nút Xác nhận OTP...")
-                await confirm_otp_btn.click()
-            else:
-                await page.keyboard.press("Enter")
+            # Sau khi gõ đủ 6 ký tự OTP, form tự động submit hoặc bấm Confirm nếu còn
+            await asyncio.sleep(1.0)
+            try:
+                confirm_otp_btn = page.locator('button:has-text("Confirm"), button:has-text("Xác nhận")').first
+                if await confirm_otp_btn.count() > 0 and await confirm_otp_btn.is_visible() and not await confirm_otp_btn.is_disabled():
+                    print("  -> Bấm nút Xác nhận OTP...")
+                    await confirm_otp_btn.click(timeout=3000)
+            except Exception:
+                pass
 
             # Xử lý thông minh các màn hình thiết lập hồ sơ Meta sau khi nhập OTP (Ngày sinh, Họ tên, Mật khẩu...)
             for step_idx in range(1, 5):
@@ -442,8 +476,11 @@ async def register_single_account(
                 if state == "authenticated" or "/access" in page.url:
                     break
                 if state == "rejected":
-                    print("  [!] Phát hiện Meta từ chối đăng ký (rejected dialog)!")
-                    break
+                    print("  [!] Phát hiện Meta từ chối đăng ký (IP bị cờ / Registration Rejected)!")
+                    await browser.close()
+                    res = {"email": email_addr, "status": "failed", "reason": "meta_registration_rejected", "url": page.url}
+                    await save_record_async(out_dir, acc_data, res)
+                    return res
 
                 acted = False
                 cur_body = (await page.locator("body").inner_text()).lower()
@@ -451,6 +488,12 @@ async def register_single_account(
                 # 1. Màn hình Ngày sinh (Birthday)
                 if state == "birthday" or any(k in cur_body for k in ["birthday", "ngày sinh", "date of birth"]):
                     print(f"  4.{step_idx}. Điền ngày sinh (15/06/1998)...")
+                    try:
+                        b_form = page.locator("form").first
+                        if await b_form.count() > 0:
+                            f_html = await b_form.inner_html()
+                            print(f"    [DOM Birthday Form]: {f_html[:350]}")
+                    except Exception: pass
                     selects = await page.locator("select").all()
                     if len(selects) >= 3:
                         try: await selects[0].select_option(index=6)
@@ -460,6 +503,15 @@ async def register_single_account(
                         try: await selects[2].select_option(value="1998")
                         except Exception: pass
                         acted = True
+                    else:
+                        b_inputs = await page.locator('input:not([type="checkbox"]):not([type="hidden"])').all()
+                        if len(b_inputs) >= 3:
+                            try:
+                                await b_inputs[0].fill("06")
+                                await b_inputs[1].fill("15")
+                                await b_inputs[2].fill("1998")
+                                acted = True
+                            except Exception: pass
 
                 # 2. Màn hình Họ tên (Name)
                 elif state == "name" or any(k in cur_body for k in ["what’s your name", "what's your name", "tên của bạn", "first name", "họ tên", "tên bắt buộc"]):
@@ -479,10 +531,13 @@ async def register_single_account(
                         acted = True
 
                 if acted:
-                    next_btn = page.locator('button[type="submit"], button:has-text("Next"), button:has-text("Tiếp tục"), button:has-text("Xác nhận"), button:has-text("Confirm"), button:has-text("Save")').first
+                    next_btn = page.locator('button[type="submit"], button:has-text("Next"), button:has-text("Continue"), button:has-text("Tiếp tục"), button:has-text("Xác nhận"), button:has-text("Confirm"), button:has-text("Save")').first
                     if await next_btn.count() > 0 and await next_btn.is_visible():
-                        await next_btn.click()
-                        await asyncio.sleep(0.5)
+                        try:
+                            await next_btn.click(timeout=3000)
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
                 else:
                     break
 
@@ -662,19 +717,36 @@ async def main():
         return
 
     accounts = []
-    with open(args.file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or "|" not in line:
-                continue
-            parts = line.split("|")
-            if len(parts) >= 4:
-                accounts.append({
-                    "email": parts[0].strip(),
-                    "pwd": parts[1].strip(),
-                    "refresh_token": parts[2].strip(),
-                    "client_id": parts[3].strip(),
-                })
+    if args.file.lower().endswith(".csv"):
+        import csv
+        with open(args.file, "r", encoding="utf-8-sig", errors="ignore") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                for col in row:
+                    if "|" in col:
+                        parts = col.strip().split("|")
+                        if len(parts) >= 4 and "@" in parts[0]:
+                            accounts.append({
+                                "email": parts[0].strip(),
+                                "pwd": parts[1].strip(),
+                                "refresh_token": parts[2].strip(),
+                                "client_id": parts[3].strip(),
+                            })
+                            break
+    else:
+        with open(args.file, "r", encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = line.split("|")
+                if len(parts) >= 4:
+                    accounts.append({
+                        "email": parts[0].strip(),
+                        "pwd": parts[1].strip(),
+                        "refresh_token": parts[2].strip(),
+                        "client_id": parts[3].strip(),
+                    })
 
     # CHỈ DÙNG OUTLOOK: lọc bỏ Hotmail/Live/MSN khỏi danh sách
     total_read = len(accounts)
