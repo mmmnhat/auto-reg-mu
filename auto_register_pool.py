@@ -251,7 +251,7 @@ async def save_record_async(out_dir: str, acc_data: Dict, res: Dict):
         save_record(out_dir, acc_data, res)
 
 
-async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
+async def wait_for_transition(page, context, max_wait: float = 12.0) -> str:
     """Đợi màn hình chuyển trạng thái thông minh: trả về loại màn hình tiếp theo ngay khi render."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
@@ -271,7 +271,7 @@ async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
         # 3. Kiểm tra các form bước tiếp theo theo selector cụ thể
         if await page.locator('[data-testid="native-auth-name-fields"], input[name*="first" i], input[placeholder*="first name" i]').count() > 0:
             return "name"
-        if await page.locator('[data-pel-impression="login_birthday_impression"]').count() > 0:
+        if await page.locator('[data-pel-impression="login_birthday_impression"], select[name*="month" i], select[name*="birth" i]').count() > 0:
             return "birthday"
         if await page.locator('input[type="password"]').count() > 0:
             return "password"
@@ -282,7 +282,7 @@ async def wait_for_transition(page, context, max_wait: float = 8.0) -> str:
         if any(k in body_text for k in ["birthday", "ngày sinh", "date of birth"]):
             return "birthday"
 
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.3)
     return "timeout"
 
 
@@ -470,19 +470,19 @@ async def register_single_account(
             await otp_input.focus()
             await page.keyboard.type(otp, delay=40)
 
-            # Sau khi gõ đủ 6 ký tự OTP, form tự động submit hoặc bấm Confirm nếu còn
+            # Sau khi gõ đủ 6 ký tự OTP, form tự động submit hoặc bấm Continue/Confirm nếu còn
             await asyncio.sleep(1.0)
             try:
-                confirm_otp_btn = page.locator('button:has-text("Confirm"), button:has-text("Xác nhận")').first
+                confirm_otp_btn = page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("Tiếp tục"), button:has-text("Confirm"), button:has-text("Xác nhận")').first
                 if await confirm_otp_btn.count() > 0 and await confirm_otp_btn.is_visible() and not await confirm_otp_btn.is_disabled():
-                    print("  -> Bấm nút Xác nhận OTP...")
+                    print("  -> Bấm nút Tiếp tục/Xác nhận OTP...")
                     await confirm_otp_btn.click(timeout=3000)
             except Exception:
                 pass
 
             # Xử lý thông minh các màn hình thiết lập hồ sơ Meta sau khi nhập OTP (Ngày sinh, Họ tên, Mật khẩu...)
-            for step_idx in range(1, 5):
-                state = await wait_for_transition(page, context, max_wait=6.0)
+            for step_idx in range(1, 6):
+                state = await wait_for_transition(page, context, max_wait=12.0)
                 if state == "authenticated" or "/access" in page.url:
                     break
                 if state == "rejected":
@@ -491,6 +491,20 @@ async def register_single_account(
                     res = {"email": email_addr, "status": "failed", "reason": "meta_registration_rejected", "url": page.url}
                     await save_record_async(out_dir, acc_data, res)
                     return res
+
+                if state == "timeout":
+                    # Xem xét nếu nút Confirm OTP vẫn còn trên màn hình
+                    confirm_btn = page.locator('button:has-text("Confirm"), button:has-text("Xác nhận")').first
+                    if await confirm_btn.count() > 0 and await confirm_btn.is_visible():
+                        try:
+                            await confirm_btn.click(force=True)
+                            await asyncio.sleep(1.0)
+                            continue
+                        except Exception:
+                            pass
+                    b_txt = " ".join((await page.locator("body").inner_text()).split())[:200]
+                    print(f"  [!] Chờ bước {step_idx} timeout (nội dung trang: {b_txt})")
+                    break
 
                 acted = False
                 cur_body = (await page.locator("body").inner_text()).lower()
@@ -583,7 +597,8 @@ async def register_single_account(
                     await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
 
                     if "/access" in page.url:
-                        print("  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)!")
+                        access_text = " ".join((await page.locator("body").inner_text()).split())[:250]
+                        print(f"  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)! Nội dung: {access_text}")
                         is_waitlist = True
                     else:
                         textarea = page.locator('textarea').first
