@@ -504,25 +504,19 @@ async def register_single_account(
                 try: await close_promo.click()
                 except Exception: pass
 
-            await email_input.click(force=True)
-            await page.keyboard.press("Meta+A")
-            await page.keyboard.press("Backspace")
-            await page.keyboard.type(email_addr, delay=10)
+            await email_input.fill(email_addr)
+            await email_input.dispatch_event("input")
+            await email_input.dispatch_event("change")
             await asyncio.sleep(0.5)
 
-            submit_btn = page.locator('button:has-text("Continue"), button:has-text("Tiếp tục"), button[type="submit"]').first
+            submit_btn = page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("Tiếp tục")').first
             start_ts = time.time()
-            submitted = False
-            for _ in range(10):
-                if await submit_btn.count() > 0 and await submit_btn.is_visible() and not await submit_btn.is_disabled():
-                    await submit_btn.click(force=True)
-                    submitted = True
-                    break
-                await asyncio.sleep(0.3)
-            if not submitted:
+            if await submit_btn.count() > 0 and await submit_btn.is_visible():
+                await submit_btn.click(force=True)
+            else:
                 await email_input.press("Enter")
 
-            # Đảm bảo trang đã submit sang màn hình OTP (chờ 25s cho mạng proxy)
+            # Đảm bảo trang đã submit sang màn hình OTP (chờ 20s cho mạng proxy)
             otp_input = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"], input[maxlength="6"]').first
             is_otp_screen = False
             try:
@@ -531,7 +525,7 @@ async def register_single_account(
             except Exception:
                 try:
                     await email_input.press("Enter")
-                    if await submit_btn.count() > 0 and await submit_btn.is_visible() and not await submit_btn.is_disabled():
+                    if await submit_btn.count() > 0 and await submit_btn.is_visible():
                         await submit_btn.click(force=True)
                     await otp_input.wait_for(state="attached", timeout=10000)
                     is_otp_screen = True
