@@ -313,10 +313,21 @@ async def wait_for_transition(page, context, max_wait: float = 12.0) -> str:
             return "authenticated"
 
         # 2. Kiểm tra rejection dialog
-        if await page.locator('[data-pel-impression*="rejected"], [data-pel-click*="rejected"]').count() > 0:
+        rej_locator = page.locator('[data-pel-impression*="rejected"], [data-pel-click*="rejected"]')
+        if await rej_locator.count() > 0:
+            try:
+                rej_text = " ".join((await rej_locator.first.inner_text()).split())
+                print(f"  [!] REJECTED DIALOG PHÁT HIỆN: {rej_text}")
+                await page.screenshot(path=os.path.join(out_dir if 'out_dir' in locals() else "/Users/mmmnhat/Downloads", "rejected_screen.png"))
+            except Exception:
+                pass
             return "rejected"
         body_text = (await page.locator("body").inner_text()).lower()
         if any(k in body_text for k in ["không thể tạo tài khoản", "we couldn't create", "registration rejected", "rejected"]):
+            try:
+                await page.screenshot(path=os.path.join(out_dir if 'out_dir' in locals() else "/Users/mmmnhat/Downloads", "rejected_screen.png"))
+            except Exception:
+                pass
             return "rejected"
 
         # 3. Kiểm tra các form bước tiếp theo theo selector cụ thể
@@ -625,26 +636,45 @@ async def register_single_account(
                         b_form = page.locator("form").first
                         if await b_form.count() > 0:
                             f_html = await b_form.inner_html()
-                            print(f"    [DOM Birthday Form]: {f_html[:350]}")
+                            print(f"    [DOM Birthday Form]: {f_html[:600]}")
                     except Exception: pass
                     selects = await page.locator("select").all()
+                    print(f"    -> Tìm thấy {len(selects)} thẻ select")
                     if len(selects) >= 3:
-                        try: await selects[0].select_option(index=6)
-                        except Exception: pass
-                        try: await selects[1].select_option(value="15")
-                        except Exception: pass
-                        try: await selects[2].select_option(value="1998")
-                        except Exception: pass
+                        try:
+                            # Month (chọn index 6 hoặc value)
+                            await selects[0].select_option(index=6)
+                            await selects[0].dispatch_event("change")
+                            await selects[0].dispatch_event("input")
+                        except Exception as se:
+                            print(f"    [!] Lỗi chọn tháng: {se}")
+                        try:
+                            await selects[1].select_option(label="15")
+                        except Exception:
+                            try: await selects[1].select_option(value="15")
+                            except Exception: pass
+                        await selects[1].dispatch_event("change")
+                        await selects[1].dispatch_event("input")
+                        try:
+                            await selects[2].select_option(label="1998")
+                        except Exception:
+                            try: await selects[2].select_option(value="1998")
+                            except Exception: pass
+                        await selects[2].dispatch_event("change")
+                        await selects[2].dispatch_event("input")
+                        await asyncio.sleep(1.5)
                         acted = True
                     else:
                         b_inputs = await page.locator('input:not([type="checkbox"]):not([type="hidden"])').all()
+                        print(f"    -> Tìm thấy {len(b_inputs)} thẻ input")
                         if len(b_inputs) >= 3:
                             try:
                                 await b_inputs[0].fill("06")
                                 await b_inputs[1].fill("15")
                                 await b_inputs[2].fill("1998")
                                 acted = True
-                            except Exception: pass
+                            except Exception as ie:
+                                print(f"    [!] Lỗi điền input ngày sinh: {ie}")
 
                 # 3. Màn hình Mật khẩu (Password)
                 elif state == "password" or await page.locator('input[type="password"]').count() > 0:
@@ -668,15 +698,26 @@ async def register_single_account(
             # Kiểm tra và xử lý màn hình Onboarding Disclosure ("A few things to know" -> "Get started")
             await asyncio.sleep(1.0)
             get_started_btn = page.locator('[data-pel-click="onboarding_disclosure_continue_click"], button:has-text("Get started"), button:has-text("Bắt đầu")').first
-            for _ in range(10):
+            for _ in range(12):
                 if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
-                    print("  5. Phát hiện màn hình Onboarding Disclosure -> Bấm nút 'Get started' để vào phòng Chat...")
+                    print(f"  5. Phát hiện màn hình Onboarding Disclosure (URL: {page.url}) -> Bấm nút 'Get started' để vào phòng Chat...")
                     try:
-                        await get_started_btn.click(force=True)
-                        await asyncio.sleep(2.5)
-                        break
+                        # Chụp ảnh trước khi click
+                        await page.screenshot(path=os.path.join(out_dir, "last_before_get_started.png"))
                     except Exception:
                         pass
+                    try:
+                        await get_started_btn.click(force=True)
+                        print("     -> Đã bấm 'Get started'! Chờ trang chuyển hướng...")
+                        await asyncio.sleep(4.0)
+                        print(f"     -> URL sau khi bấm Get started: {page.url}")
+                        try:
+                            await page.screenshot(path=os.path.join(out_dir, "last_after_get_started.png"))
+                        except Exception:
+                            pass
+                        break
+                    except Exception as ge:
+                        print(f"     [!] Lỗi khi bấm Get started: {ge}")
                 await asyncio.sleep(0.5)
 
             # BƯỚC 6: XÁC THỰC THỰC TẾ BẰNG LỆNH TẠO VIDEO "MUSE VẪY TAY"
@@ -684,8 +725,8 @@ async def register_single_account(
             if verify_video:
                 print("  6. Kiểm tra quyền hạn thực tế: Mở phòng chat và gửi lệnh tạo video 'Muse vẫy tay'...")
                 try:
-                    # Nếu chưa ở /thread, mở trực tiếp /thread/new
-                    if "/thread" not in page.url and await page.locator("textarea").count() == 0:
+                    # Nếu chưa ở /thread và chưa thấy textarea, nhưng cũng không bị kẹt ở waitlist
+                    if "/thread" not in page.url and await page.locator("textarea").count() == 0 and "/access" not in page.url:
                         try:
                             await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
                         except Exception:
@@ -696,7 +737,7 @@ async def register_single_account(
                     if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
                         try:
                             await get_started_btn.click(force=True)
-                            await asyncio.sleep(2.5)
+                            await asyncio.sleep(3.0)
                         except Exception:
                             pass
 

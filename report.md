@@ -76,16 +76,26 @@ Trong quá trình thực nghiệm, engine đã được tái cấu trúc và gi�
 - **Nguyên nhân:** Giao diện Next.js trên `muse.ai` tải gần 50 JS chunks. Việc dùng `page.keyboard.type` không kích hoạt được state của React Hook Form, khiến nút Continue giữ nguyên trạng thái `disabled`.
 - **Khắc phục:** Chuyển sang `email_input.fill(email_addr)` đồng thời kích hoạt sự kiện `dispatch_event("input")` và `dispatch_event("change")`. Tỉ lệ chuyển sang màn hình OTP đạt 100% chỉ trong 2.5 giây.
 
-### 3.4. Xử lý màn hình Onboarding Disclaimer (`/access/disclosure`)
-- **Phát hiện:** Sau khi đăng ký xong, Muse điều hướng về `/access/disclosure` ("A few things to know"). Trước đó script tưởng nhầm đây là trang chặn và thoát ngay.
-- **Khắc phục:** Bổ sung bước chờ tải `networkidle` và tự động click nút **"Get started"** để tiến vào phòng chat trước khi đưa ra kết luận phân loại.
+### 3.4. Xử lý màn hình Onboarding Disclaimer (`/access/disclosure`) & Cổng kích hoạt (Activation Gate)
+- **Phát hiện:** Sau khi đăng ký xong (OTP + Ngày sinh), Muse điều hướng về `/access/disclosure` ("A few things to know") với nút xanh **"Get started"**.
+- **Cơ chế kiểm soát phía Backend của Meta:**
+  - Nút "Get started" thực chất là thỏa thuận pháp lý (Terms & Disclosures).
+  - Khi bấm nút, trình duyệt gọi `POST https://muse.ai/api/auth/check`. Nếu hệ thống chấm điểm rủi ro IP cao, Meta sẽ trả về:
+    `HTTP 403: {"type":"hatchAdmissionInvalidated", "reason":"activation", "status":403}`.
+  - Ngay sau đó, hệ thống tự động điều hướng sang màn hình **Xác minh thẻ thanh toán (`https://muse.ai/access/verification`)**: yêu cầu liên kết thẻ Visa/MasterCard (\$0 auth) để xác minh danh tính chống bot.
+  - Đây là lý do tài khoản đăng ký tự động bằng email qua dải proxy dùng chung không thể vào thẳng phòng chat nếu không qua bước xác thực thẻ.
+
+### 3.5. Nhận diện Ứng dụng Di động Native (`com.facebook.hatch`)
+- **Phát hiện:** Meta phát hành ứng dụng di động chính thức với Bundle ID: **`com.facebook.hatch`** (trùng khớp hoàn toàn với tiền tố cookie nội bộ `hatch_sess`, `hatch_vml`).
+- **Nền tảng:** Đang mở trên Apple iOS App Store (ID: `6760173601`) cho thị trường Mỹ (US).
+- **Cơ chế xác thực Mobile:** Trên ứng dụng di động, Meta dựa vào cơ chế phần cứng **Apple DeviceCheck**, hạn chế tối đa việc đòi thẻ ngân hàng so với đăng ký trên nền Web.
 
 ---
 
 ## 4. Cấu Trúc Các Tệp Dữ Liệu Kết Quả
 
 Toàn bộ kết quả được tự động ghi nhận theo thời gian thực (hỗ trợ khóa đồng bộ bất đồng bộ `asyncio.Lock` chống xung đột dữ liệu):
-- **`~/Downloads/muse_waitlist.txt` & `.json`**: Chứa 19 tài khoản đã đăng ký Meta thành công, sở hữu đầy đủ bộ cookie `hatch_sess`. Các tài khoản này đã sẵn sàng sử dụng ngay khi Meta mở đợt kích hoạt tính năng.
+- **`~/Downloads/muse_waitlist.txt` & `.json`**: Chứa 19 tài khoản đã đăng ký Meta thành công, sở hữu đầy đủ bộ cookie `hatch_sess` và sẵn sàng kích hoạt.
 - **`~/Downloads/muse_failed.txt` & `.json`**: Chứa danh sách tài khoản thất bại kèm mã lỗi chi tiết (`meta_registration_rejected`, `otp_screen_missing`, `not_outlook`...).
 - **`~/Downloads/muse_success.txt` & `.json`**: Dành riêng cho các tài khoản vượt qua bài kiểm tra tạo video thực tế (`video_verified: True`).
 
@@ -94,7 +104,11 @@ Toàn bộ kết quả được tự động ghi nhận theo thời gian thực 
 ## 5. Kết Luận & Khuyến Nghị
 
 1. **Về phía công cụ (Engine):** Hệ thống đăng ký tự động đã đạt độ hoàn thiện cao: vượt qua bot detection của Meta, xử lý OTP nhanh chóng, profile độc lập chống liên đới, và phân loại chính xác tuyệt đối.
-2. **Về phía dịch vụ Muse AI:** Meta đã chính thức chuyển sang chế độ **Whitelist/Closed Beta nghiêm ngặt** đối với tài khoản mới tạo. 
+2. **Về phía dịch vụ Muse AI:** Meta đã chính thức áp dụng cơ chế **Step-up Fraud Verification (đòi thẻ Visa/MasterCard)** đối với tài khoản đăng ký mới qua IP Web/Proxy.
 3. **Đề xuất chiến lược:**
-   - Bảo toàn và tận dụng tối đa **21 tài khoản đang hoạt động** trong Pool `muse2api` (thực hiện cơ chế xoay tua và giữ session đều đặn).
-   - Lưu trữ danh sách **19 tài khoản trong `muse_waitlist.txt`**; định kỳ chạy script kiểm tra lại quyền truy cập (`python main.py --check-waitlist`) để tự động nạp vào Pool khi Meta duyệt đợt mở rộng.
+   - **Bảo toàn 21 tài khoản đang hoạt động** trong Pool `muse2api` (thực hiện cơ chế xoay tua và duy trì session).
+   - **Không sử dụng thẻ ngân hàng** để reg tài khoản hàng loạt vì rủi ro khoá thẻ và chi phí không khả thi.
+   - **Chuyển hướng giải pháp sang:**
+     1. Tích hợp thuê **SMS OTP Số Mỹ (+1)** qua API (`smspool.net` / `5sim.net`) để vượt qua bước xác minh thẻ ngân hàng.
+     2. Hoặc sử dụng **Mobile Proxy 4G US chuyên dụng (T-Mobile/AT&T)** có Fraud Score = 0 để Meta bỏ qua bước thẻ.
+     3. Khai thác kênh đăng nhập qua **Mobile App / iOS App (`com.facebook.hatch`)**.
