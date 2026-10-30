@@ -665,107 +665,112 @@ async def register_single_account(
                 else:
                     break
 
-            # Kiểm tra trạng thái cuối cùng sau khi hoàn tất Onboarding
+            # Kiểm tra và xử lý màn hình Onboarding Disclosure ("A few things to know" -> "Get started")
             await asyncio.sleep(1.0)
-            current_url = page.url
-            body_text = await page.locator("body").inner_text()
-            print(f"  -> URL sau đăng nhập: {current_url}")
-
-            cookies_list = await context.cookies()
-            cookies_dict = {c["name"]: c["value"] for c in cookies_list}
-            cookies_exp = {c["name"]: int(c.get("expires", 0)) for c in cookies_list}
-            print(f"  -> Cookies tìm thấy: {list(cookies_dict.keys())}")
-
-            has_sess = "hatch_sess" in cookies_dict
-            has_vml = "hatch_vml" in cookies_dict
-            is_waitlist = False
+            get_started_btn = page.locator('[data-pel-click="onboarding_disclosure_continue_click"], button:has-text("Get started"), button:has-text("Bắt đầu")').first
+            for _ in range(10):
+                if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
+                    print("  5. Phát hiện màn hình Onboarding Disclosure -> Bấm nút 'Get started' để vào phòng Chat...")
+                    try:
+                        await get_started_btn.click(force=True)
+                        await asyncio.sleep(2.5)
+                        break
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
 
             # BƯỚC 6: XÁC THỰC THỰC TẾ BẰNG LỆNH TẠO VIDEO "MUSE VẪY TAY"
             video_verified = False
-            if verify_video and has_sess and not is_waitlist:
+            if verify_video:
                 print("  6. Kiểm tra quyền hạn thực tế: Mở phòng chat và gửi lệnh tạo video 'Muse vẫy tay'...")
                 try:
-                    try:
-                        await page.goto("https://muse.ai/thread/new", wait_until="networkidle", timeout=25000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2.0)
-
-                    # Xử lý màn hình điều khoản giới thiệu /access/disclosure ("A few things to know")
-                    get_started_btn = page.locator('button:has-text("Get started"), button:has-text("Bắt đầu"), button[type="submit"]').first
-                    if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
-                        print("  -> Phát hiện màn hình Điều khoản Giới thiệu ('Get started')! Đang bấm xác nhận để vào Chat...")
+                    # Nếu chưa ở /thread, mở trực tiếp /thread/new
+                    if "/thread" not in page.url and await page.locator("textarea").count() == 0:
                         try:
-                            await get_started_btn.click(timeout=3000)
-                            await asyncio.sleep(3.0)
+                            await page.goto("https://muse.ai/thread/new", wait_until="domcontentloaded", timeout=25000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0)
+
+                    # Bấm lại Get started nếu trang vẫn hiển thị disclosure
+                    if await get_started_btn.count() > 0 and await get_started_btn.is_visible():
+                        try:
+                            await get_started_btn.click(force=True)
+                            await asyncio.sleep(2.5)
                         except Exception:
                             pass
 
-                    if "/access" in page.url and await page.locator('textarea').count() == 0:
-                        access_text = " ".join((await page.locator("body").inner_text()).split())[:250]
-                        print(f"  [!] Sau khi đăng nhập, URL chuyển hướng về /access (Waitlist)! Nội dung: {access_text}")
-                        is_waitlist = True
-                    else:
-                        textarea = page.locator('textarea').first
-                        try:
-                            await textarea.wait_for(state="visible", timeout=12000)
-                        except Exception:
-                            textarea = None
+                    # Kiểm tra khung chat textarea
+                    textarea = page.locator('textarea, [data-testid*="composer" i]').first
+                    try:
+                        await textarea.wait_for(state="visible", timeout=12000)
+                    except Exception:
+                        textarea = None
 
-                        if textarea and await textarea.is_visible():
-                            print("  -> Tìm thấy khung chat! Đang nhập lệnh tạo video...")
-                            await textarea.click()
-                            prompt_msg = "Tạo một video: Muse vẫy tay chào thân thiện (Create a short video: waving hand friendly)"
-                            # Dùng fill thay vì press_sequentially để gửi tức thì trong 0.01s
-                            await textarea.fill(prompt_msg)
+                    if textarea and await textarea.is_visible():
+                        print("  [✓] ĐÃ VÀO PHÒNG CHAT THÀNH CÔNG! Đang nhập lệnh tạo video...")
+                        await textarea.click(force=True)
+                        prompt_msg = "Tạo một video: Muse vẫy tay chào thân thiện (Create a short video: waving hand friendly)"
+                        await textarea.fill(prompt_msg)
+                        await asyncio.sleep(0.5)
 
-                            send_btn = page.locator('button[aria-label*="Send" i], button[aria-label*="Gửi" i], button[data-testid*="send" i], button:has-text("Send"), button:has-text("Gửi")').first
-                            if await send_btn.count() > 0 and await send_btn.is_enabled():
-                                await send_btn.click()
-                            else:
-                                await textarea.press("Enter")
-
-                            print("  -> Đã gửi lệnh! Đang đợi Muse AI kích hoạt tiến trình tạo video (tối đa 30s)...")
-                            v_deadline = time.time() + 30
-                            while time.time() < v_deadline:
-                                # 1. Nút Stop xuất hiện = Muse đang sinh video
-                                stop_btn = page.locator('[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止" i]')
-                                if await stop_btn.count() > 0:
-                                    video_verified = True
-                                    print("  [✓] Phát hiện nút Stop: Muse AI đang tích cực tạo video!")
-                                    break
-
-                                # 2. Thẻ video hoặc attachment video xuất hiện
-                                vid = page.locator('video, [data-testid*="presentation-video"]')
-                                if await vid.count() > 0:
-                                    video_verified = True
-                                    print("  [✓] Phát hiện thẻ Video trên luồng chat!")
-                                    break
-
-                                # 3. Phản hồi chat bubble từ bot về video
-                                bubble = page.locator('div[class*="hatch-agent-bubble-bg"]')
-                                if await bubble.count() > 0:
-                                    b_txt = (await bubble.last.inner_text()).lower()
-                                    if any(k in b_txt for k in ["video", "generating", "creating", "vẫy tay", "đang tạo"]):
-                                        video_verified = True
-                                        print(f"  [✓] Muse AI phản hồi tiến trình: {b_txt[:80]}...")
-                                        break
-
-                                # Kiểm tra thông báo lỗi hoặc giới hạn
-                                err_box = page.locator('[role="alert"], [class*="error"]')
-                                if await err_box.count() > 0:
-                                    err_txt = await err_box.first.inner_text()
-                                    print(f"  [!] Có thông báo lỗi trên trang: {err_txt[:100]}")
-                                    break
-
-                                await asyncio.sleep(0.35)
+                        send_btn = page.locator('button[aria-label*="Send" i], button[aria-label*="Gửi" i], button[data-testid*="send" i], button:has-text("Send"), button:has-text("Gửi")').first
+                        if await send_btn.count() > 0 and await send_btn.is_enabled():
+                            await send_btn.click(force=True)
                         else:
-                            print("  [!] Không tìm thấy khung nhập lệnh (textarea) trên https://muse.ai/thread/new!")
+                            await textarea.press("Enter")
+
+                        print("  -> Đã gửi lệnh! Đang đợi Muse AI kích hoạt tiến trình tạo video (tối đa 30s)...")
+                        v_deadline = time.time() + 30
+                        while time.time() < v_deadline:
+                            # 1. Nút Stop xuất hiện = Muse đang sinh video
+                            stop_btn = page.locator('[data-testid="hatch-composer-stop-button"], button[aria-label*="Stop" i], button[aria-label*="停止" i]')
+                            if await stop_btn.count() > 0:
+                                video_verified = True
+                                print("  [✓] Phát hiện nút Stop: Muse AI đang tích cực tạo video!")
+                                break
+
+                            # 2. Thẻ video hoặc attachment video xuất hiện
+                            vid = page.locator('video, [data-testid*="presentation-video"]')
+                            if await vid.count() > 0:
+                                video_verified = True
+                                print("  [✓] Phát hiện thẻ Video trên luồng chat!")
+                                break
+
+                            # 3. Phản hồi chat bubble từ bot về video
+                            bubble = page.locator('div[class*="hatch-agent-bubble-bg"]')
+                            if await bubble.count() > 0:
+                                b_txt = (await bubble.last.inner_text()).lower()
+                                if any(k in b_txt for k in ["video", "generating", "creating", "vẫy tay", "đang tạo"]):
+                                    video_verified = True
+                                    print(f"  [✓] Muse AI phản hồi tiến trình: {b_txt[:80]}...")
+                                    break
+
+                            # Kiểm tra thông báo lỗi hoặc giới hạn
+                            err_box = page.locator('[role="alert"], [class*="error"]')
+                            if await err_box.count() > 0:
+                                err_txt = await err_box.first.inner_text()
+                                print(f"  [!] Có thông báo lỗi trên trang: {err_txt[:100]}")
+                                break
+
+                            await asyncio.sleep(0.35)
+                    else:
+                        print("  [!] Không tìm thấy khung nhập lệnh (textarea) trên https://muse.ai/thread/new!")
                 except Exception as ve:
                     print(f"  [!] Ngoại lệ trong bước gửi lệnh tạo video: {ve}")
 
-            # ĐÁNH GIÁ KẾT QUẢ CUỐI CÙNG
+            # ĐÁNH GIÁ VÀ CẬP NHẬT COOKIES MỚI NHẤT
+            await asyncio.sleep(1.0)
             final_url = page.url
+            cookies_list = await context.cookies()
+            cookies_dict = {c["name"]: c["value"] for c in cookies_list}
+            cookies_exp = {c["name"]: int(c.get("expires", 0)) for c in cookies_list}
+            print(f"  -> URL sau hoàn tất: {final_url}")
+            print(f"  -> Cookies cập nhật: {list(cookies_dict.keys())}")
+
+            has_sess = "hatch_sess" in cookies_dict
+            has_vml = "hatch_vml" in cookies_dict
+            is_waitlist = ("/access" in final_url and "disclosure" not in final_url and not video_verified)
             if (video_verified if verify_video else (has_sess and has_vml and not is_waitlist)):
                 print("  🎉 [✓] ĐĂNG KÝ VÀ TẠO VIDEO THÀNH CÔNG! Tài khoản hoạt động 100%!")
                 if muse2api_base and muse2api_key:
